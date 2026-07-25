@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CreateWebFlowChecker",
+  "version": "0.1.0",
+  "identifier": "jp.lg.city.kashihara.cwfchecker",
+  "build": {
+    "frontendDist": "../web",
+    "removeUnusedCommands": true
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.ico"]
+  }
+}
+

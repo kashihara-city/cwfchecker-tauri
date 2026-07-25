@@ -1,0 +1,12 @@
+# ソースはOSに関係なくLFで保持し、改行コードだけの差分を防ぐ。
+* text=auto
+*.css text eol=lf
+*.html text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+
+# アイコンはテキスト変換の対象にしない。
+*.ico binary

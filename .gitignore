@@ -1,0 +1,27 @@
+# Rust/Cargoのビルド成果物
+/src-tauri/target/
+
+# Tauriがコマンドや権限定義から自動生成するスキーマ
+/src-tauri/gen/schemas/
+
+# 配布用バイナリと手動検証時の画像・一時ファイル
+/release/
+/verification/
+
+# ローカル環境固有の設定や秘密情報
+.env
+.env.*
+!.env.example
+
+# エディター・OS・ログの一時ファイル
+/.idea/
+/.vscode/
+*.log
+Thumbs.db
+.DS_Store
+
+# Windowsリンカーが生成する中間ファイル
+*.exp
+*.ilk
+*.lib
+*.pdb

@@ -1,0 +1,38 @@
+[package]
+name = "cwfchecker-tauri-no-npm"
+version = "0.1.0"
+description = "Create Web Flow Checker ported from Electron to Tauri without npm"
+authors = ["Kashihara City"]
+edition = "2021"
+
+[lib]
+name = "cwfchecker_tauri_no_npm_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", default-features = false, features = ["wry", "tray-icon", "image-ico"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+url = "2"
+winreg = "0.55"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security_Credentials",
+  "Win32_Security_Cryptography",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging"
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="./settings.css" />
+    <title>設定画面</title>
+  </head>
+  <body>
+    <!--
+      設定画面はアプリに同梱したローカルHTMLだけで構成する。
+      入力内容の最終検証と保存はRust側で行い、HTMLの制約だけには依存しない。
+    -->
+    <main class="container">
+      <h1>設定情報</h1>
+      <form id="settings-form">
+        <label for="id">ID</label>
+        <input id="id" autocomplete="username" placeholder="ログインID" />
+
+        <!-- 空欄なら、Windows資格情報マネージャーにある現在のPWを維持する。 -->
+        <label for="password">PW</label>
+        <input id="password" type="password" autocomplete="current-password" placeholder="変更しない場合は空欄" />
+
+        <label for="ad-server">AD Server</label>
+        <input id="ad-server" placeholder="ActiveDirectoryサーバー名" />
+
+        <label for="cwf-address">CWFAddress（サーバーURL）</label>
+        <input id="cwf-address" type="url" required placeholder="https://example/XFV20/portlet/wfportlet.jsp" />
+
+        <label for="interval">確認間隔（分）</label>
+        <input id="interval" type="number" min="15" step="1" required />
+
+        <!-- Tauriのショートカット記法に合わせ、複数キーは+で区切る。 -->
+        <label for="shortcut">ショートカットキー</label>
+        <input id="shortcut" aria-describedby="shortcut-help" placeholder="例: SHIFT+F2" />
+        <small id="shortcut-help" class="help">複数のキーは「+」で区切ってください（例: SHIFT+F2）。</small>
+
+        <label class="check-row" for="notify">
+          <span>ポップアップせず通知バーでお知らせ</span>
+          <input id="notify" type="checkbox" />
+        </label>
+
+        <!-- role=statusにより、保存結果をスクリーンリーダーにも伝える。 -->
+        <p id="status" role="status"></p>
+        <button type="submit">設定反映</button>
+      </form>
+    </main>
+    <script src="./settings.js"></script>
+  </body>
+</html>

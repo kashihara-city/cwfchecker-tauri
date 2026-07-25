@@ -1,0 +1,961 @@
+//! Tauriアプリの画面、タスクトレイ、タイマー、ダウンロードをまとめて管理する。
+//!
+//! 個別の保存処理は`settings`、`credentials`、`migration`へ分け、このファイルは
+//! それらを「いつ呼ぶか」と、WebViewから来た情報をどう画面へ反映するかに集中する。
+
+use crate::{
+    credentials, migration, registry_support,
+    settings::{self, Settings},
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
+    thread,
+    time::Duration,
+};
+use tauri::{
+    menu::{Menu, MenuBuilder, SubmenuBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::{DownloadEvent, NewWindowResponse, PageLoadEvent},
+    AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
+};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutEvent, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
+use url::Url;
+use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+const MAIN_LABEL: &str = "main";
+const SETTINGS_LABEL: &str = "settings";
+const APP_TITLE: &str = "CreateWebFlowChecker";
+/// ダウンロード直後にShellExecuteで開くと危険な、実行・スクリプト系の拡張子。
+const BLOCKED_DOWNLOAD_EXTENSIONS: &[&str] = &[
+    "bat", "cmd", "com", "cpl", "dll", "exe", "hta", "jar", "jse", "js", "lnk", "msi", "msp",
+    "ps1", "reg", "scr", "sys", "url", "vbe", "vbs", "wsf", "wsh",
+];
+
+/// OS差を吸収するTauriプラグインを通してWindows通知を表示する。
+fn show_windows_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|error| error.to_string())
+}
+
+/// 複数のコールバックやタイマースレッドから共有するアプリの状態。
+///
+/// `RwLock`は設定の読み書きを、`Atomic*`は単純なフラグや件数を安全に共有する。
+pub struct AppState {
+    settings: RwLock<Settings>,
+    cache_root: PathBuf,
+    download_dir: PathBuf,
+    quitting: AtomicBool,
+    settings_opening: AtomicBool,
+    decisions: AtomicUsize,
+    decision_counter: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// 設定画面からTauriコマンドへ渡される入力。PWは保存済み設定には含めない。
+pub struct SettingsInput {
+    id: String,
+    password: String,
+    ad_server: String,
+    cwf_address: String,
+    interval_minutes: u32,
+    notify_by_bar: bool,
+    shortcut: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// 設定画面へ返す表示用データ。パスワードそのものはWebViewへ渡さない。
+pub struct SettingsView {
+    id: String,
+    ad_server: String,
+    cwf_address: String,
+    interval_minutes: u32,
+    notify_by_bar: bool,
+    shortcut: String,
+    has_password: bool,
+}
+
+#[derive(Debug)]
+/// WebView内のJavaScriptがページを調査した結果。
+pub struct PageReport {
+    decision_count: usize,
+    auth_count: usize,
+    image_count: usize,
+    content_height: usize,
+    count_text: String,
+}
+
+fn lock_error() -> String {
+    "設定情報のロックに失敗しました。".to_owned()
+}
+
+fn settings_snapshot(state: &AppState) -> Result<Settings, String> {
+    state
+        .settings
+        .read()
+        .map(|value| value.clone())
+        .map_err(|_| lock_error())
+}
+
+fn build_portlet_url(settings: &Settings, password: &str) -> Result<Url, String> {
+    let mut url = Url::parse(&settings.cwf_address)
+        .map_err(|_| "CWFAddressが正しいURLではありません。".to_owned())?;
+    url.set_fragment(None);
+    {
+        // Create!Webフローのポートレット仕様が要求するクエリを組み立てる。
+        // 既存クエリは残さず、設定画面で検証済みの接続先だけを使用する。
+        let mut query = url.query_pairs_mut();
+        query
+            .clear()
+            .append_pair("view", "recv")
+            .append_pair("loginid", &settings.id)
+            .append_pair("pwd", password)
+            .append_pair("ldapsvr", &settings.ad_server);
+    }
+    Ok(url)
+}
+
+fn configured_url(state: &AppState) -> Result<Option<Url>, String> {
+    let settings = settings_snapshot(state)?;
+    if settings.cwf_address.is_empty() || settings.id.is_empty() {
+        return Ok(None);
+    }
+    let Some(credential) =
+        credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    if credential.username != settings.id {
+        // 別IDの資格情報を誤って使用しない。設定画面でPWを再入力すれば修復できる。
+        return Ok(None);
+    }
+    build_portlet_url(&settings, &credential.password).map(Some)
+}
+
+fn configured_origin(state: &AppState) -> Result<Option<String>, String> {
+    let settings = settings_snapshot(state)?;
+    if settings.cwf_address.is_empty() {
+        return Ok(None);
+    }
+    let url = Url::parse(&settings.cwf_address)
+        .map_err(|_| "CWFAddressが正しいURLではありません。".to_owned())?;
+    Ok(Some(url.origin().ascii_serialization()))
+}
+
+fn webview_script(origin: &str) -> String {
+    // JSON文字列化してから埋め込むことで、URL内の引用符などをJavaScriptとして
+    // 解釈させない。スクリプト側でもtop-levelかつ同一オリジンのページだけを扱う。
+    let origin = serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".to_owned());
+    format!(
+        r#"
+(() => {{
+  const allowedOrigin = {origin};
+  // iframeや想定外サーバーでは、ページ内容の読取りやRust側への報告を行わない。
+  if (window.top !== window || window.location.origin !== allowedOrigin) return;
+  const imageCandidates = [
+    "cwfchecker_footer01.jpg", "cwfchecker_footer02.jpg",
+    "cwfchecker_footer03.jpg", "cwfchecker_footer04.jpg",
+    "cwfchecker_footer05.jpg", "cwfchecker_footer01.png",
+    "cwfchecker_footer02.png", "cwfchecker_footer03.png",
+    "cwfchecker_footer04.png", "cwfchecker_footer05.png"
+  ];
+  const countMatches = (source, needle) =>
+    needle ? (source.match(new RegExp(needle, "g")) || []).length : 0;
+  const checkImage = (url) => new Promise((resolve) => {{
+    const image = new Image();
+    // ポートレットURLの認証クエリを画像リクエストのRefererへ載せない。
+    image.referrerPolicy = "no-referrer";
+    image.onload = image.onerror = () => resolve(image.naturalWidth > 0 ? url : null);
+    image.src = url;
+  }});
+  window.__cwfScan = async () => {{
+    if (!document.body || window.__cwfScanRunning) return;
+    window.__cwfScanRunning = true;
+    try {{
+      // 旧Electron版と同じ目印を数え、処理待ち件数と認証成功を判定する。
+      const html = document.body.innerHTML;
+      const decisionCount = countMatches(html, "anchor anchor-primary");
+      const authCount = countMatches(html, "<!-- 認証成功 -->");
+      const countText = document.querySelector("ul.form-list_h span.dummy")?.textContent?.trim() || "0";
+      const baseUrl = window.location.href.split("XFV20")[0];
+      const images = (await Promise.all(imageCandidates.map(
+        name => checkImage(`${{baseUrl}}XFV20/manual/user/_images/${{name}}`)
+      ))).filter(Boolean);
+      // 更新のたびにフッターが増えないよう、前回追加した要素を先に取り除く。
+      document.querySelectorAll(".cwfchecker-tauri-footer").forEach(node => node.remove());
+      let contentHeight = 0;
+      if (images.length > 0) {{
+        const footer = document.createElement("div");
+        footer.className = "footer cwfchecker-tauri-footer";
+        footer.style.width = "100%";
+        footer.style.maxWidth = "100%";
+        footer.style.boxSizing = "border-box";
+        footer.style.overflow = "hidden";
+        const image = document.createElement("img");
+        image.referrerPolicy = "no-referrer";
+        image.style.display = "block";
+        image.style.width = "100%";
+        image.style.maxWidth = "100%";
+        image.style.height = "auto";
+        image.style.objectFit = "contain";
+        image.src = images[Math.floor(Math.random() * images.length)];
+        footer.appendChild(image);
+        const contents = document.querySelector("div.contents");
+        if (contents) {{
+          contents.insertAdjacentElement("afterend", footer);
+          const root = document.documentElement;
+          const previousOverflowY = root.style.overflowY;
+          root.style.overflowY = "hidden";
+          try {{
+            try {{ await image.decode(); }} catch {{}}
+            // 画像のレイアウト確定を2フレーム待ってから、Rust側へ正確な高さを返す。
+            await new Promise(resolve => requestAnimationFrame(
+              () => requestAnimationFrame(resolve)
+            ));
+            contentHeight = Math.ceil(footer.getBoundingClientRect().bottom + window.scrollY);
+          }} finally {{
+            root.style.overflowY = previousOverflowY;
+          }}
+        }}
+      }}
+      const previousTitle = document.title;
+      // 外部ページにはTauri IPCを公開しないため、一時的なdocument.titleを
+      // 最小限の通信路として使う。Rust側でもウィンドウ名とoriginを再検証する。
+      document.title = `__CWFCHECKER_REPORT__|${{decisionCount}}|${{authCount}}|${{images.length}}|${{contentHeight}}|${{countText.replaceAll("|", "")}}`;
+      await new Promise(resolve => setTimeout(resolve, 0));
+      document.title = previousTitle;
+    }} finally {{
+      window.__cwfScanRunning = false;
+    }}
+  }};
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", () => window.__cwfScan(), {{ once: true }});
+  }} else {{
+    window.__cwfScan();
+  }}
+}})();
+"#
+    )
+}
+
+fn cache_root() -> PathBuf {
+    std::env::temp_dir()
+        .join("KashiharaCity")
+        .join("CwfChecker")
+        .join("WebView2")
+}
+
+fn prepare_cache() -> std::io::Result<PathBuf> {
+    let root = cache_root();
+    // WebView2の認証状態を次回起動へ持ち越さない。単一起動プラグインにより、
+    // 同時に使用中の別プロセスのキャッシュを消す状況は避けられる。
+    if root.exists() {
+        let _ = fs::remove_dir_all(&root);
+    }
+    let current = root.join(std::process::id().to_string());
+    fs::create_dir_all(&current)?;
+    Ok(current)
+}
+
+fn cleanup_directory(path: &Path) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if candidate.is_file() {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+}
+
+/// Windowsの関連付けアプリでファイルまたはURLを開く。
+fn open_external(value: &str) -> Result<(), String> {
+    let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    let value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            value.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize <= 32 {
+        Err("Windowsで対象を開けませんでした。".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+/// 自動実行につながりやすいファイル形式かを、最終拡張子で判定する。
+fn is_blocked_download(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    // Windowsは末尾の空白やピリオドを正規化するため、判定前にも除去する。
+    // コロンは代替データストリーム指定になり得るので許可しない。
+    let normalized = name.trim_end_matches([' ', '.']);
+    if normalized.contains(':') {
+        return true;
+    }
+    Path::new(normalized)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            BLOCKED_DOWNLOAD_EXTENSIONS
+                .iter()
+                .any(|blocked| extension.eq_ignore_ascii_case(blocked))
+        })
+}
+
+/// URLが設定されたCreate!Webフローと同じオリジンかを確認する。
+///
+/// オリジンはスキーム、ホスト、ポートの組であり、パスだけの比較より厳密である。
+fn has_allowed_origin(url: &Url, allowed_origin: &str) -> bool {
+    matches!(url.scheme(), "http" | "https") && url.origin().ascii_serialization() == allowed_origin
+}
+
+fn configure_download(
+    builder: WebviewWindowBuilder<'_, tauri::Wry, impl Manager<tauri::Wry>>,
+    download_dir: PathBuf,
+) -> WebviewWindowBuilder<'_, tauri::Wry, impl Manager<tauri::Wry>> {
+    builder.on_download(move |_webview, event| {
+        match event {
+            DownloadEvent::Requested { destination, .. } => {
+                if fs::create_dir_all(&download_dir).is_err() {
+                    return false;
+                }
+                let filename = destination
+                    .file_name()
+                    .map(|name| name.to_owned())
+                    .unwrap_or_else(|| "download".into());
+                if is_blocked_download(Path::new(&filename)) {
+                    // 添付を自動で開く設計のため、実行・スクリプト形式は
+                    // ダウンロード自体を中止し、誤実行を防ぐ。
+                    return false;
+                }
+                *destination = download_dir.join(filename);
+            }
+            DownloadEvent::Finished {
+                path: Some(path),
+                success: true,
+                ..
+            } if !is_blocked_download(&path) => {
+                // Requested側を迂回する予期しないイベントにも備え、開く直前にも確認する。
+                let _ = open_external(&path.to_string_lossy());
+            }
+            _ => {}
+        }
+        true
+    })
+}
+
+/// メイン画面があれば再読込して前面へ出し、未設定なら設定画面を開く。
+fn show_main(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_LABEL) {
+        let _ = window.eval("window.location.reload()");
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else {
+        let _ = open_settings(app);
+    }
+}
+
+/// 設定画面を1枚だけ作成し、既にあればその画面を再利用する。
+fn open_settings(app: &AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(SETTINGS_LABEL) {
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let menu = build_window_menu(app, SETTINGS_LABEL).map_err(|error| error.to_string())?;
+    WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
+        .title("CreateWebFlowChecker — 設定")
+        .inner_size(600.0, 900.0)
+        .center()
+        .menu(menu)
+        .on_menu_event(|window, event| {
+            handle_window_menu(window, event.id().as_ref());
+        })
+        .build()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// 短時間に複数メニューイベントが来ても設定画面を重複作成しない。
+fn request_open_settings(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(SETTINGS_LABEL) {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return;
+    }
+    let Some(state) = app.try_state::<Arc<AppState>>() else {
+        return;
+    };
+    if state.settings_opening.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let app = app.clone();
+    // ウィンドウ生成完了を待つ間、メニューイベントの処理を占有しない。
+    thread::spawn(move || {
+        let _ = open_settings(&app);
+        if let Some(state) = app.try_state::<Arc<AppState>>() {
+            state.settings_opening.store(false, Ordering::Release);
+        }
+    });
+}
+
+/// Create!Webフローのポートレットを表示するメインWebViewを作る。
+fn create_main_window(app: &AppHandle, state: Arc<AppState>, url: Url) -> Result<(), String> {
+    let origin =
+        configured_origin(&state)?.ok_or_else(|| "CWFAddressが設定されていません。".to_owned())?;
+    let script = webview_script(&origin);
+    let origin_for_main_navigation = origin.clone();
+    let origin_for_popup = origin.clone();
+    let app_for_popup = app.clone();
+    let state_for_popup = state.clone();
+    let state_for_report = state.clone();
+    let download_dir = state.download_dir.clone();
+    let cache = state.cache_root.clone();
+    let menu = build_window_menu(app, MAIN_LABEL).map_err(|error| error.to_string())?;
+
+    let builder = WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::External(url))
+        .title(APP_TITLE)
+        .inner_size(600.0, 520.0)
+        .position(0.0, 0.0)
+        .visible(false)
+        .data_directory(cache)
+        .initialization_script(script)
+        .menu(menu)
+        // パスワード付きポートレットを、リダイレクトで別サイトへ遷移させない。
+        .on_navigation(move |url| has_allowed_origin(url, &origin_for_main_navigation))
+        .on_menu_event(|window, event| {
+            handle_window_menu(window, event.id().as_ref());
+        })
+        .on_page_load(|window, payload| {
+            if matches!(payload.event(), PageLoadEvent::Finished) {
+                let _ = window.eval("window.__cwfScan?.()");
+            }
+        })
+        .on_document_title_changed(move |window, title| {
+            if let Some(report) = parse_report_title(&title) {
+                let _ =
+                    process_page_report(window.app_handle(), &window, &state_for_report, report);
+                let _ = window.set_title(APP_TITLE);
+            }
+        })
+        .on_new_window(move |url, features| {
+            if !has_allowed_origin(&url, &origin_for_popup) {
+                // 外部リンクは資格情報を持つWebViewへ読み込まず、通常ブラウザへ分離する。
+                if matches!(url.scheme(), "http" | "https") {
+                    let _ = open_external(url.as_str());
+                }
+                return NewWindowResponse::Deny;
+            }
+            if url.path().ends_with("/XFV20/login") {
+                let _ = open_external(url.as_str());
+                return NewWindowResponse::Deny;
+            }
+
+            let number = state_for_popup
+                .decision_counter
+                .fetch_add(1, Ordering::Relaxed);
+            let label = format!("decision-{number}");
+            let menu = match build_window_menu(&app_for_popup, &label) {
+                Ok(menu) => menu,
+                Err(_) => return NewWindowResponse::Deny,
+            };
+            let decision_origin = origin_for_popup.clone();
+            let decision = WebviewWindowBuilder::new(
+                &app_for_popup,
+                label,
+                WebviewUrl::External("about:blank".parse().expect("valid URL")),
+            )
+            .title(APP_TITLE)
+            .window_features(features)
+            .data_directory(state_for_popup.cache_root.clone())
+            .on_navigation(move |url| {
+                url.as_str() == "about:blank" || has_allowed_origin(url, &decision_origin)
+            })
+            .menu(menu)
+            .on_menu_event(|window, event| {
+                handle_window_menu(window, event.id().as_ref());
+            });
+            let decision = configure_download(decision, state_for_popup.download_dir.clone());
+            match decision.build() {
+                Ok(window) => {
+                    state_for_popup.decisions.fetch_add(1, Ordering::Relaxed);
+                    let _ = window.maximize();
+                    NewWindowResponse::Create { window }
+                }
+                Err(_) => NewWindowResponse::Deny,
+            }
+        });
+    configure_download(builder, download_dir)
+        .build()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn build_window_menu(app: &AppHandle, window_label: &str) -> tauri::Result<Menu<tauri::Wry>> {
+    let app_menu = SubmenuBuilder::new(app, "メニュー")
+        .text(format!("settings:{window_label}"), "設定画面")
+        .separator()
+        .text(format!("quit:{window_label}"), "アプリ終了")
+        .build()?;
+    MenuBuilder::new(app)
+        .item(&app_menu)
+        .text(format!("reload:{window_label}"), "更新")
+        .text(format!("close:{window_label}"), "閉じる")
+        .build()
+}
+
+/// タスクトレイのアイコンと、表示・終了メニューを作る。
+fn create_tray(app: &AppHandle) -> tauri::Result<()> {
+    let tray_menu = MenuBuilder::new(app)
+        .text("show", "表示")
+        .separator()
+        .text("quit", "電子決裁確認アプリ終了")
+        .build()?;
+    let mut tray = TrayIconBuilder::with_id("main-tray")
+        .menu(&tray_menu)
+        .show_menu_on_left_click(false)
+        .tooltip(APP_TITLE);
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon);
+    }
+    tray.on_tray_icon_event(|tray, event| {
+        if matches!(
+            event,
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+        ) {
+            show_main(tray.app_handle());
+        }
+    })
+    .on_menu_event(|app, event| {
+        handle_tray_menu(app, event.id().as_ref());
+    })
+    .build(app)?;
+    Ok(())
+}
+
+fn start_timer(app: AppHandle, state: Arc<AppState>) {
+    // 専用スレッドは最小15分眠り、案件画面や設定画面を操作中でない場合だけ更新する。
+    // UI操作そのものはTauriのスレッドセーフなAppHandle経由で依頼する。
+    thread::spawn(move || loop {
+        let minutes = settings_snapshot(&state)
+            .map(|settings| settings.interval_minutes)
+            .unwrap_or(15)
+            .max(15);
+        thread::sleep(Duration::from_secs(minutes as u64 * 60));
+        if state.quitting.load(Ordering::Relaxed)
+            || state.decisions.load(Ordering::Relaxed) > 0
+            || app.get_webview_window(SETTINGS_LABEL).is_some()
+        {
+            continue;
+        }
+        if let Some(window) = app.get_webview_window(MAIN_LABEL) {
+            let _ = window.eval("window.location.reload()");
+        }
+    });
+}
+
+#[tauri::command]
+/// 設定画面だけに、パスワードを除いた現在値を返すTauriコマンド。
+pub fn get_settings(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<SettingsView, String> {
+    if window.label() != SETTINGS_LABEL {
+        return Err("許可されていないウィンドウです。".to_owned());
+    }
+    let settings = settings_snapshot(&state)?;
+    let has_password = credentials::read(credentials::TARGET)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|credential| credential.username == settings.id);
+    Ok(SettingsView {
+        id: settings.id,
+        ad_server: settings.ad_server,
+        cwf_address: settings.cwf_address,
+        interval_minutes: settings.interval_minutes,
+        notify_by_bar: settings.notify_by_bar,
+        shortcut: settings.shortcut,
+        has_password,
+    })
+}
+
+#[tauri::command]
+/// 設定画面の入力を検証し、資格情報とレジストリへ保存するTauriコマンド。
+pub fn save_settings(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<AppState>>,
+    input: SettingsInput,
+) -> Result<(), String> {
+    if window.label() != SETTINGS_LABEL {
+        return Err("許可されていないウィンドウです。".to_owned());
+    }
+    let settings = Settings {
+        id: input.id,
+        ad_server: input.ad_server,
+        cwf_address: input.cwf_address,
+        interval_minutes: input.interval_minutes,
+        notify_by_bar: input.notify_by_bar,
+        shortcut: input.shortcut,
+    }
+    .normalize()?;
+    if settings.id.is_empty() {
+        return Err("IDを入力してください。".to_owned());
+    }
+
+    // 保存済みPWはWebViewへ返さず、空欄で送られた場合だけRust側で引き継ぐ。
+    let existing = credentials::read(credentials::TARGET).map_err(|error| error.to_string())?;
+    let password = if input.password.is_empty() {
+        let existing = existing
+            .as_ref()
+            .ok_or_else(|| "PWを入力してください。".to_owned())?;
+        if existing.username != settings.id {
+            return Err("IDを変更する場合はPWも入力してください。".to_owned());
+        }
+        existing.password.clone()
+    } else {
+        input.password
+    };
+    credentials::write(credentials::TARGET, &settings.id, &password)
+        .map_err(|error| error.to_string())?;
+    let verified = credentials::read(credentials::TARGET)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|value| value.username == settings.id && value.password == password);
+    if !verified {
+        let _ = credentials::restore(existing.as_ref());
+        return Err("Windows資格情報の保存後検証に失敗しました。".to_owned());
+    }
+
+    let registry_result = (|| -> Result<(), String> {
+        registry_support::report_io(
+            "アプリ設定の保存",
+            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+            settings::write(&settings),
+        )
+        .map_err(|error| error.to_string())?;
+        let verified = registry_support::report_io(
+            "アプリ設定の保存後確認",
+            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+            settings::verify(&settings),
+        )
+        .map_err(|error| error.to_string())?;
+        registry_support::require_verified(
+            "アプリ設定の保存後確認",
+            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+            verified,
+        )
+        .map_err(|error| error.to_string())
+    })();
+    if let Err(error) = registry_result {
+        return match credentials::restore(existing.as_ref()) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
+            )),
+        };
+    }
+    *state.settings.write().map_err(|_| lock_error())? = settings;
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        app.restart();
+    });
+    Ok(())
+}
+
+fn parse_report_title(title: &str) -> Option<PageReport> {
+    let mut parts = title.strip_prefix("__CWFCHECKER_REPORT__|")?.splitn(5, '|');
+    let decision_count: usize = parts.next()?.parse().ok()?;
+    let auth_count: usize = parts.next()?.parse().ok()?;
+    let image_count: usize = parts.next()?.parse().ok()?;
+    let content_height: usize = parts.next()?.parse().ok()?;
+    // document.titleはサーバー側ページが変更できるため、通知へ出す文字列は
+    // 制御文字を除去し、長さも制限する。空なら数えた案件数を使用する。
+    let mut count_text: String = parts
+        .next()?
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(32)
+        .collect();
+    if count_text.is_empty() {
+        count_text = decision_count.to_string();
+    }
+    Some(PageReport {
+        decision_count,
+        auth_count,
+        image_count,
+        content_height,
+        count_text,
+    })
+}
+
+/// WebViewから受けた調査結果を、ウィンドウサイズと通知へ反映する。
+fn process_page_report(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    state: &Arc<AppState>,
+    report: PageReport,
+) -> Result<(), String> {
+    if window.label() != MAIN_LABEL {
+        return Err("許可されていないウィンドウです。".to_owned());
+    }
+    let expected =
+        configured_origin(state)?.ok_or_else(|| "CWFAddressが設定されていません。".to_owned())?;
+    let actual = window
+        .url()
+        .map_err(|error| error.to_string())?
+        .origin()
+        .ascii_serialization();
+    if actual != expected {
+        return Err("許可されていないオリジンです。".to_owned());
+    }
+    let rows = report.decision_count.clamp(1, 30);
+    let requested_height = if report.image_count > 0 && report.content_height > 0 {
+        report.content_height
+    } else {
+        290 + rows * 35
+    };
+    let maximum_height = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor.size().height.saturating_sub(60) as usize)
+        .unwrap_or(requested_height);
+    let height = requested_height.min(maximum_height);
+    window
+        .set_size(PhysicalSize::new(600, height as u32))
+        .map_err(|error| error.to_string())?;
+    let _ = window.set_position(PhysicalPosition::new(0, 0));
+
+    if report.decision_count > 0 {
+        let settings = settings_snapshot(state)?;
+        let visible = window.is_visible().unwrap_or(false);
+        if settings.notify_by_bar && !visible {
+            let body = format!("{} 件処理待ちです。", report.count_text);
+            if let Err(error) = show_windows_notification(app, APP_TITLE, &body) {
+                eprintln!("Windows通知の表示に失敗しました: {error}");
+            }
+        } else {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+    if report.auth_count > 0 {
+        // 認証成功の目印を同一オリジンのページで確認できた時点でのみ、
+        // 移行元を削除する。単なる書き込み後照合だけでは削除しない。
+        if let Ok(current) = settings_snapshot(state) {
+            let _ = credentials::delete(&credentials::legacy_target(&current.id));
+        }
+        if let Some(path) = migration::legacy_config_path() {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+/// Tauri起動時に一度だけ呼ばれ、共有状態と各UI部品を準備する。
+pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let cache_root = prepare_cache()?;
+    let download_dir = app.path().document_dir()?.join("cwf_downloads");
+    let settings = migration::load_or_migrate()?;
+    let state = Arc::new(AppState {
+        settings: RwLock::new(settings),
+        cache_root,
+        download_dir,
+        quitting: AtomicBool::new(false),
+        settings_opening: AtomicBool::new(false),
+        decisions: AtomicUsize::new(0),
+        decision_counter: AtomicUsize::new(1),
+    });
+    app.manage(state.clone());
+
+    create_tray(app.handle())?;
+    let shortcut_text = settings_snapshot(&state)
+        .map(|settings| settings.shortcut)
+        .unwrap_or_else(|_| "F3".to_owned());
+    if let Ok(shortcut) = shortcut_text.parse::<tauri_plugin_global_shortcut::Shortcut>() {
+        let _ = app.global_shortcut().register(shortcut);
+    }
+
+    match configured_url(&state)? {
+        Some(url) => create_main_window(app.handle(), state.clone(), url)?,
+        None => open_settings(app.handle())?,
+    }
+    start_timer(app.handle().clone(), state);
+    Ok(())
+}
+
+fn handle_window_menu(window: &tauri::Window, id: &str) {
+    // メニューIDに対象ウィンドウ名を含め、別ウィンドウの操作を取り違えない。
+    let Some((action, target_label)) = id.split_once(':') else {
+        return;
+    };
+    if target_label != window.label() {
+        return;
+    }
+
+    let app = window.app_handle();
+    match action {
+        "settings" => {
+            request_open_settings(app);
+        }
+        "reload" => {
+            if let Some(webview) = app.get_webview_window(window.label()) {
+                let _ = webview.eval("window.location.reload()");
+            }
+        }
+        "close" => {
+            let _ = window.close();
+        }
+        "quit" => {
+            if let Some(state) = app.try_state::<Arc<AppState>>() {
+                state.quitting.store(true, Ordering::Relaxed);
+            }
+            app.exit(0);
+        }
+        _ => {}
+    }
+}
+
+fn handle_tray_menu(app: &AppHandle, id: &str) {
+    match id {
+        "show" => show_main(app),
+        "quit" => {
+            if let Some(state) = app.try_state::<Arc<AppState>>() {
+                state.quitting.store(true, Ordering::Relaxed);
+            }
+            app.exit(0);
+        }
+        _ => {}
+    }
+}
+
+/// 閉じるボタンを「常駐」に置き換え、案件画面終了時には一時ファイルを片付ける。
+pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
+    let app = window.app_handle();
+    let Some(state) = app.try_state::<Arc<AppState>>() else {
+        return;
+    };
+    if window.label() == MAIN_LABEL {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            if !state.quitting.load(Ordering::Relaxed) {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        }
+    } else if window.label().starts_with("decision-") && matches!(event, WindowEvent::Destroyed) {
+        // saturating_sub相当で、予期しない重複イベントでもusizeの最大値へ
+        // アンダーフローしないようにする。
+        let previous = state
+            .decisions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        if previous <= 1 {
+            cleanup_directory(&state.download_dir);
+            show_main(app);
+        }
+    }
+}
+
+/// グローバルショートカットが押されたとき、メイン画面の表示状態を切り替える。
+pub fn handle_shortcut(
+    app: &AppHandle,
+    _shortcut: &tauri_plugin_global_shortcut::Shortcut,
+    event: ShortcutEvent,
+) {
+    if event.state == ShortcutState::Pressed {
+        if let Some(main) = app.get_webview_window(MAIN_LABEL) {
+            if main.is_visible().unwrap_or(false)
+                && app
+                    .webview_windows()
+                    .keys()
+                    .all(|label| !label.starts_with("decision-"))
+            {
+                let _ = main.hide();
+            } else {
+                show_main(app);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_allowed_origin, is_blocked_download, parse_report_title};
+    use std::path::Path;
+    use url::Url;
+
+    #[test]
+    fn parses_rendered_content_height() {
+        let report = parse_report_title("__CWFCHECKER_REPORT__|3|1|2|746|3").expect("valid report");
+
+        assert_eq!(report.decision_count, 3);
+        assert_eq!(report.auth_count, 1);
+        assert_eq!(report.image_count, 2);
+        assert_eq!(report.content_height, 746);
+        assert_eq!(report.count_text, "3");
+    }
+
+    #[test]
+    fn sanitizes_text_received_through_the_document_title() {
+        let long_text = format!("{}\nignored", "9".repeat(40));
+        let title = format!("__CWFCHECKER_REPORT__|3|0|0|0|{long_text}");
+        let report = parse_report_title(&title).expect("valid report");
+
+        assert_eq!(report.count_text, "9".repeat(32));
+    }
+
+    #[test]
+    fn blocks_executable_downloads_and_windows_name_tricks() {
+        assert!(is_blocked_download(Path::new("attachment.EXE")));
+        assert!(is_blocked_download(Path::new("attachment.cmd.")));
+        assert!(is_blocked_download(Path::new("attachment.txt:payload.exe")));
+        assert!(!is_blocked_download(Path::new("attachment.pdf")));
+    }
+
+    #[test]
+    fn accepts_only_the_configured_web_origin() {
+        let allowed = "https://workflow.example";
+        assert!(has_allowed_origin(
+            &Url::parse("https://workflow.example/XFV20/portlet").expect("URL"),
+            allowed
+        ));
+        assert!(!has_allowed_origin(
+            &Url::parse("https://other.example/XFV20/portlet").expect("URL"),
+            allowed
+        ));
+        assert!(!has_allowed_origin(
+            &Url::parse("file:///C:/temp/test.html").expect("URL"),
+            allowed
+        ));
+    }
+}
