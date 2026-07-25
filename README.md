@@ -9,7 +9,7 @@ Windows向けデスクトップアプリケーションです。
 旧Electron版
 [kashihara-city/cwfchecker](https://github.com/kashihara-city/cwfchecker)
 の動作を、Rust、Tauri、静的HTML/CSS/JavaScriptで再実装しています。
-Node.js、npm、`node_modules`、インストーラは使用しません。
+単独exeで動作し、設定値はレジストリで管理するため、GPOによる一斉デプロイ等も可能です。
 
 ## 動作要件
 
