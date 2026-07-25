@@ -205,10 +205,10 @@ cargo build --release --locked
 生成されるexe：
 
 ```text
-src-tauri\target\release\cwfchecker-tauri-no-npm.exe
+src-tauri\target\release\CreateWebFlowChecker.exe
 ```
 
-配布時は任意の場所へ`CreateWebFlowChecker.exe`などの名前でコピーして使用できます。
+生成された`CreateWebFlowChecker.exe`を任意の場所へコピーして使用できます。
 インストーラはありません。
 
 ## 主な依存ライブラリ

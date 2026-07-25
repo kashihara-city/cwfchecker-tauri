@@ -5,6 +5,10 @@ description = "Create Web Flow Checker ported from Electron to Tauri without npm
 authors = ["Kashihara City"]
 edition = "2021"
 
+[[bin]]
+name = "CreateWebFlowChecker"
+path = "src/main.rs"
+
 [lib]
 name = "cwfchecker_tauri_no_npm_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
