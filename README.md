@@ -15,8 +15,12 @@ Node.js、npm、`node_modules`、インストーラは使用しません。
 
 - Windows 11
 - Microsoft Edge WebView2 Runtime
+- Microsoft Visual C++ 再頒布可能パッケージ（x64版、`VC_redist.x64.exe`）
 - Create!Webフローのポートレット表示オプションが利用可能であること
 - ポートレット画面のHTTPまたはHTTPS URLを指定できること
+
+`VC_redist.x64.exe`が未導入の環境では、本アプリを起動する前に
+Microsoft Visual C++ 再頒布可能パッケージのx64版をインストールしてください。
 
 本アプリはインフォテック社の公認・許諾を受けた製品ではありません。
 利用環境のCreate!Webフローに対する動作確認を行ったうえで使用してください。
