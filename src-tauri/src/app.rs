@@ -251,7 +251,9 @@ fn webview_script(origin: &str) -> String {
     image.src = url;
   }});
   window.__cwfScan = async () => {{
-    if (!document.body || window.__cwfScanRunning) return;
+    // DOMContentLoadedとTauriのページ読込み完了が続けて発火しても、
+    // 同じドキュメントの調査結果は一度だけRust側へ報告する。
+    if (!document.body || window.__cwfScanRunning || window.__cwfScanReported) return;
     window.__cwfScanRunning = true;
     try {{
       // 旧Electron版と同じ目印を数え、処理待ち件数と認証成功を判定する。
@@ -303,6 +305,9 @@ fn webview_script(origin: &str) -> String {
       const previousTitle = document.title;
       // 外部ページにはTauri IPCを公開しないため、一時的なdocument.titleを
       // 最小限の通信路として使う。Rust側でもウィンドウ名とoriginを再検証する。
+      // 報告直前に印を付け、直後に起きた二度目の走査による重複通知を防ぐ。
+      // ページ更新や再POSTではwindow自体が作り直されるため、次回は再び報告される。
+      window.__cwfScanReported = true;
       document.title = `__CWFCHECKER_REPORT__|${{decisionCount}}|${{authCount}}|${{images.length}}|${{contentHeight}}|${{countText.replaceAll("|", "")}}`;
       await new Promise(resolve => setTimeout(resolve, 0));
       document.title = previousTitle;
@@ -1044,7 +1049,7 @@ pub fn handle_shortcut(
 mod tests {
     use super::{
         build_portlet_endpoint, has_allowed_origin, is_blocked_download, is_portlet_bootstrap_url,
-        parse_report_title,
+        parse_report_title, webview_script,
     };
     use crate::settings::Settings;
     use std::path::Path;
@@ -1068,6 +1073,14 @@ mod tests {
         let report = parse_report_title(&title).expect("valid report");
 
         assert_eq!(report.count_text, "9".repeat(32));
+    }
+
+    #[test]
+    fn generated_script_reports_each_document_only_once() {
+        let script = webview_script("https://workflow.example");
+
+        assert!(script.contains("window.__cwfScanRunning || window.__cwfScanReported"));
+        assert!(script.contains("window.__cwfScanReported = true;"));
     }
 
     #[test]
