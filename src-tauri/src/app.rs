@@ -33,6 +33,7 @@ use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWN
 const MAIN_LABEL: &str = "main";
 const SETTINGS_LABEL: &str = "settings";
 const APP_TITLE: &str = "CreateWebFlowChecker";
+const NOTIFICATION_TITLE: &str = "電子決裁確認アプリ";
 const PORTLET_BOOTSTRAP_URL: &str = "http://tauri.localhost/portlet-bootstrap.html";
 /// ダウンロード直後にShellExecuteで開くと危険な、実行・スクリプト系の拡張子。
 const BLOCKED_DOWNLOAD_EXTENSIONS: &[&str] = &[
@@ -887,7 +888,7 @@ fn process_page_report(
         let visible = window.is_visible().unwrap_or(false);
         if settings.notify_by_bar && !visible {
             let body = format!("{} 件処理待ちです。", report.count_text);
-            if let Err(error) = show_windows_notification(app, APP_TITLE, &body) {
+            if let Err(error) = show_windows_notification(app, NOTIFICATION_TITLE, &body) {
                 eprintln!("Windows通知の表示に失敗しました: {error}");
             }
         } else {
@@ -1049,7 +1050,7 @@ pub fn handle_shortcut(
 mod tests {
     use super::{
         build_portlet_endpoint, has_allowed_origin, is_blocked_download, is_portlet_bootstrap_url,
-        parse_report_title, webview_script,
+        parse_report_title, webview_script, NOTIFICATION_TITLE,
     };
     use crate::settings::Settings;
     use std::path::Path;
@@ -1081,6 +1082,11 @@ mod tests {
 
         assert!(script.contains("window.__cwfScanRunning || window.__cwfScanReported"));
         assert!(script.contains("window.__cwfScanReported = true;"));
+    }
+
+    #[test]
+    fn uses_the_japanese_notification_title() {
+        assert_eq!(NOTIFICATION_TITLE, "電子決裁確認アプリ");
     }
 
     #[test]
