@@ -176,10 +176,14 @@ WebView2の一時データは起動時に作り直します。
 
 ## セキュリティ上の注意
 
-- ポートレット仕様によりログイン情報をURLのクエリへ設定するため、
-  `CWFAddress`には可能な限りHTTPSを使用してください。
+- ID、PW、AD Server、表示種別は、公式ポートレット仕様に従って
+  `application/x-www-form-urlencoded`のPOST本文で送信します。
+  認証情報はURLのクエリ、静的HTML、ログへ出力しません。
+- POST本文もHTTPでは暗号化されないため、`CWFAddress`にはHTTPSを使用してください。
 - メイン画面と案件画面は、設定した`CWFAddress`と同じオリジンだけを
-  WebView内に表示します。外部のHTTP・HTTPSリンクは通常ブラウザで開きます。
+  WebView内に表示します。SAML認証中はIdPへのHTTPSリダイレクトを一時的に許可し、
+  認証完了後は再び設定サーバーへ制限します。通常の外部HTTP・HTTPSリンクは
+  既定ブラウザで開きます。
 - パスワードそのものは設定画面のWebViewへ読み返さず、Windows資格情報
   マネージャー内で保持します。
 - WebView2データはプロセス別の一時フォルダーへ置き、次回起動時に削除します。

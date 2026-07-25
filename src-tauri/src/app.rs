@@ -33,6 +33,7 @@ use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWN
 const MAIN_LABEL: &str = "main";
 const SETTINGS_LABEL: &str = "settings";
 const APP_TITLE: &str = "CreateWebFlowChecker";
+const PORTLET_BOOTSTRAP_URL: &str = "http://tauri.localhost/portlet-bootstrap.html";
 /// ダウンロード直後にShellExecuteで開くと危険な、実行・スクリプト系の拡張子。
 const BLOCKED_DOWNLOAD_EXTENSIONS: &[&str] = &[
     "bat", "cmd", "com", "cpl", "dll", "exe", "hta", "jar", "jse", "js", "lnk", "msi", "msp",
@@ -58,6 +59,10 @@ pub struct AppState {
     download_dir: PathBuf,
     quitting: AtomicBool,
     settings_opening: AtomicBool,
+    /// Rustが開始したローカルPOST画面への遷移だけを一度許可する。
+    post_navigation_armed: AtomicBool,
+    /// SAML利用時に限り、認証完了までIdPへのHTTPSリダイレクトを許可する。
+    authentication_in_progress: AtomicBool,
     decisions: AtomicUsize,
     decision_counter: AtomicUsize,
 }
@@ -110,21 +115,12 @@ fn settings_snapshot(state: &AppState) -> Result<Settings, String> {
         .map_err(|_| lock_error())
 }
 
-fn build_portlet_url(settings: &Settings, password: &str) -> Result<Url, String> {
+/// 認証情報を含まないポートレットの送信先URLを作る。
+fn build_portlet_endpoint(settings: &Settings) -> Result<Url, String> {
     let mut url = Url::parse(&settings.cwf_address)
         .map_err(|_| "CWFAddressが正しいURLではありません。".to_owned())?;
+    url.set_query(None);
     url.set_fragment(None);
-    {
-        // Create!Webフローのポートレット仕様が要求するクエリを組み立てる。
-        // 既存クエリは残さず、設定画面で検証済みの接続先だけを使用する。
-        let mut query = url.query_pairs_mut();
-        query
-            .clear()
-            .append_pair("view", "recv")
-            .append_pair("loginid", &settings.id)
-            .append_pair("pwd", password)
-            .append_pair("ldapsvr", &settings.ad_server);
-    }
     Ok(url)
 }
 
@@ -142,7 +138,7 @@ fn configured_url(state: &AppState) -> Result<Option<Url>, String> {
         // 別IDの資格情報を誤って使用しない。設定画面でPWを再入力すれば修復できる。
         return Ok(None);
     }
-    build_portlet_url(&settings, &credential.password).map(Some)
+    build_portlet_endpoint(&settings).map(Some)
 }
 
 fn configured_origin(state: &AppState) -> Result<Option<String>, String> {
@@ -153,6 +149,79 @@ fn configured_origin(state: &AppState) -> Result<Option<String>, String> {
     let url = Url::parse(&settings.cwf_address)
         .map_err(|_| "CWFAddressが正しいURLではありません。".to_owned())?;
     Ok(Some(url.origin().ascii_serialization()))
+}
+
+/// Tauriが同梱HTMLを配信する、POST開始専用ページかを判定する。
+fn is_portlet_bootstrap_url(url: &Url) -> bool {
+    url.scheme() == "http"
+        && url.host_str() == Some("tauri.localhost")
+        && url.path() == "/portlet-bootstrap.html"
+}
+
+/// ローカルページ上で一度だけ実行する、公式例と同じhiddenフォームPOSTを作る。
+///
+/// IDとPWはURLへ連結せず、`application/x-www-form-urlencoded`のPOST本文として
+/// WebView2から送信する。JSON文字列化により、引用符などをJavaScriptとして
+/// 解釈させない。
+fn portlet_post_script(state: &AppState) -> Result<String, String> {
+    let settings = settings_snapshot(state)?;
+    let credential = credentials::read(credentials::TARGET)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "PWが保存されていません。".to_owned())?;
+    if credential.username != settings.id {
+        return Err("設定中のIDと保存済みPWのIDが一致しません。".to_owned());
+    }
+
+    let action = serde_json::to_string(build_portlet_endpoint(&settings)?.as_str())
+        .map_err(|error| error.to_string())?;
+    let fields = serde_json::to_string(&[
+        ("view", "recv"),
+        ("loginid", settings.id.as_str()),
+        ("pwd", credential.password.as_str()),
+        ("ldapsvr", settings.ad_server.as_str()),
+    ])
+    .map_err(|error| error.to_string())?;
+
+    Ok(format!(
+        r#"
+(() => {{
+  if (window.location.href !== {bootstrap}) return;
+  const form = document.createElement("form");
+  form.method = "post";
+  form.action = {action};
+  form.referrerPolicy = "no-referrer";
+  for (const [name, value] of {fields}) {{
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }}
+  document.body.appendChild(form);
+  form.submit();
+}})();
+"#,
+        bootstrap =
+            serde_json::to_string(PORTLET_BOOTSTRAP_URL).map_err(|error| error.to_string())?
+    ))
+}
+
+/// POST開始ページへ遷移する直前だけ許可フラグを立てる。
+fn begin_portlet_load(window: &WebviewWindow, state: &AppState) -> Result<(), String> {
+    let bootstrap = Url::parse(PORTLET_BOOTSTRAP_URL)
+        .map_err(|_| "POST開始ページのURLが不正です。".to_owned())?;
+    state.post_navigation_armed.store(true, Ordering::Release);
+    state
+        .authentication_in_progress
+        .store(true, Ordering::Release);
+    if let Err(error) = window.navigate(bootstrap) {
+        state.post_navigation_armed.store(false, Ordering::Release);
+        state
+            .authentication_in_progress
+            .store(false, Ordering::Release);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 fn webview_script(origin: &str) -> String {
@@ -369,7 +438,9 @@ fn configure_download(
 /// メイン画面があれば再読込して前面へ出し、未設定なら設定画面を開く。
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_LABEL) {
-        let _ = window.eval("window.location.reload()");
+        if let Some(state) = app.try_state::<Arc<AppState>>() {
+            let _ = begin_portlet_load(&window, &state);
+        }
         let _ = window.show();
         let _ = window.set_focus();
     } else {
@@ -423,91 +494,139 @@ fn request_open_settings(app: &AppHandle) {
 }
 
 /// Create!Webフローのポートレットを表示するメインWebViewを作る。
-fn create_main_window(app: &AppHandle, state: Arc<AppState>, url: Url) -> Result<(), String> {
-    let origin =
-        configured_origin(&state)?.ok_or_else(|| "CWFAddressが設定されていません。".to_owned())?;
+fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> Result<(), String> {
+    let origin = endpoint.origin().ascii_serialization();
     let script = webview_script(&origin);
     let origin_for_main_navigation = origin.clone();
     let origin_for_popup = origin.clone();
     let app_for_popup = app.clone();
+    let state_for_navigation = state.clone();
+    let state_for_page_load = state.clone();
     let state_for_popup = state.clone();
     let state_for_report = state.clone();
     let download_dir = state.download_dir.clone();
     let cache = state.cache_root.clone();
     let menu = build_window_menu(app, MAIN_LABEL).map_err(|error| error.to_string())?;
 
-    let builder = WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::External(url))
+    let builder = WebviewWindowBuilder::new(
+        app,
+        MAIN_LABEL,
+        WebviewUrl::App("portlet-bootstrap.html".into()),
+    )
+    .title(APP_TITLE)
+    .inner_size(600.0, 520.0)
+    .position(0.0, 0.0)
+    .visible(false)
+    .data_directory(cache)
+    .initialization_script(script)
+    .menu(menu)
+    .on_navigation(move |url| {
+        if has_allowed_origin(url, &origin_for_main_navigation) {
+            return true;
+        }
+        if is_portlet_bootstrap_url(url)
+            && state_for_navigation
+                .post_navigation_armed
+                .load(Ordering::Acquire)
+        {
+            return true;
+        }
+        // SAML認証中だけはIdPへのHTTPSリダイレクトを許可する。
+        state_for_navigation
+            .authentication_in_progress
+            .load(Ordering::Acquire)
+            && url.scheme() == "https"
+    })
+    .on_menu_event(|window, event| {
+        handle_window_menu(window, event.id().as_ref());
+    })
+    .on_page_load(move |window, payload| {
+        if !matches!(payload.event(), PageLoadEvent::Finished) {
+            return;
+        }
+        let Ok(current_url) = window.url() else {
+            return;
+        };
+        if is_portlet_bootstrap_url(&current_url) {
+            // Rustが開始した遷移につき一度だけ、PWをPOST本文へ載せる。
+            if state_for_page_load
+                .post_navigation_armed
+                .swap(false, Ordering::AcqRel)
+            {
+                match portlet_post_script(&state_for_page_load) {
+                    Ok(script) => {
+                        if let Err(error) = window.eval(&script) {
+                            state_for_page_load
+                                .authentication_in_progress
+                                .store(false, Ordering::Release);
+                            eprintln!("ポートレットのPOST開始に失敗しました: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        state_for_page_load
+                            .authentication_in_progress
+                            .store(false, Ordering::Release);
+                        eprintln!("ポートレットのPOST情報を作成できませんでした: {error}");
+                    }
+                }
+            }
+        } else if has_allowed_origin(&current_url, &origin) {
+            let _ = window.eval("window.__cwfScan?.()");
+        }
+    })
+    .on_document_title_changed(move |window, title| {
+        if let Some(report) = parse_report_title(&title) {
+            let _ = process_page_report(window.app_handle(), &window, &state_for_report, report);
+            let _ = window.set_title(APP_TITLE);
+        }
+    })
+    .on_new_window(move |url, features| {
+        if !has_allowed_origin(&url, &origin_for_popup) {
+            // 外部リンクは資格情報を持つWebViewへ読み込まず、通常ブラウザへ分離する。
+            if matches!(url.scheme(), "http" | "https") {
+                let _ = open_external(url.as_str());
+            }
+            return NewWindowResponse::Deny;
+        }
+        if url.path().ends_with("/XFV20/login") {
+            let _ = open_external(url.as_str());
+            return NewWindowResponse::Deny;
+        }
+
+        let number = state_for_popup
+            .decision_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let label = format!("decision-{number}");
+        let menu = match build_window_menu(&app_for_popup, &label) {
+            Ok(menu) => menu,
+            Err(_) => return NewWindowResponse::Deny,
+        };
+        let decision_origin = origin_for_popup.clone();
+        let decision = WebviewWindowBuilder::new(
+            &app_for_popup,
+            label,
+            WebviewUrl::External("about:blank".parse().expect("valid URL")),
+        )
         .title(APP_TITLE)
-        .inner_size(600.0, 520.0)
-        .position(0.0, 0.0)
-        .visible(false)
-        .data_directory(cache)
-        .initialization_script(script)
+        .window_features(features)
+        .data_directory(state_for_popup.cache_root.clone())
+        .on_navigation(move |url| {
+            url.as_str() == "about:blank" || has_allowed_origin(url, &decision_origin)
+        })
         .menu(menu)
-        // パスワード付きポートレットを、リダイレクトで別サイトへ遷移させない。
-        .on_navigation(move |url| has_allowed_origin(url, &origin_for_main_navigation))
         .on_menu_event(|window, event| {
             handle_window_menu(window, event.id().as_ref());
-        })
-        .on_page_load(|window, payload| {
-            if matches!(payload.event(), PageLoadEvent::Finished) {
-                let _ = window.eval("window.__cwfScan?.()");
-            }
-        })
-        .on_document_title_changed(move |window, title| {
-            if let Some(report) = parse_report_title(&title) {
-                let _ =
-                    process_page_report(window.app_handle(), &window, &state_for_report, report);
-                let _ = window.set_title(APP_TITLE);
-            }
-        })
-        .on_new_window(move |url, features| {
-            if !has_allowed_origin(&url, &origin_for_popup) {
-                // 外部リンクは資格情報を持つWebViewへ読み込まず、通常ブラウザへ分離する。
-                if matches!(url.scheme(), "http" | "https") {
-                    let _ = open_external(url.as_str());
-                }
-                return NewWindowResponse::Deny;
-            }
-            if url.path().ends_with("/XFV20/login") {
-                let _ = open_external(url.as_str());
-                return NewWindowResponse::Deny;
-            }
-
-            let number = state_for_popup
-                .decision_counter
-                .fetch_add(1, Ordering::Relaxed);
-            let label = format!("decision-{number}");
-            let menu = match build_window_menu(&app_for_popup, &label) {
-                Ok(menu) => menu,
-                Err(_) => return NewWindowResponse::Deny,
-            };
-            let decision_origin = origin_for_popup.clone();
-            let decision = WebviewWindowBuilder::new(
-                &app_for_popup,
-                label,
-                WebviewUrl::External("about:blank".parse().expect("valid URL")),
-            )
-            .title(APP_TITLE)
-            .window_features(features)
-            .data_directory(state_for_popup.cache_root.clone())
-            .on_navigation(move |url| {
-                url.as_str() == "about:blank" || has_allowed_origin(url, &decision_origin)
-            })
-            .menu(menu)
-            .on_menu_event(|window, event| {
-                handle_window_menu(window, event.id().as_ref());
-            });
-            let decision = configure_download(decision, state_for_popup.download_dir.clone());
-            match decision.build() {
-                Ok(window) => {
-                    state_for_popup.decisions.fetch_add(1, Ordering::Relaxed);
-                    let _ = window.maximize();
-                    NewWindowResponse::Create { window }
-                }
-                Err(_) => NewWindowResponse::Deny,
-            }
         });
+        let decision = configure_download(decision, state_for_popup.download_dir.clone());
+        match decision.build() {
+            Ok(window) => {
+                state_for_popup.decisions.fetch_add(1, Ordering::Relaxed);
+                let _ = window.maximize();
+                NewWindowResponse::Create { window }
+            }
+            Err(_) => NewWindowResponse::Deny,
+        }
+    });
     configure_download(builder, download_dir)
         .build()
         .map(|_| ())
@@ -576,7 +695,7 @@ fn start_timer(app: AppHandle, state: Arc<AppState>) {
             continue;
         }
         if let Some(window) = app.get_webview_window(MAIN_LABEL) {
-            let _ = window.eval("window.location.reload()");
+            let _ = begin_portlet_load(&window, &state);
         }
     });
 }
@@ -736,6 +855,10 @@ fn process_page_report(
     if actual != expected {
         return Err("許可されていないオリジンです。".to_owned());
     }
+    // 設定サーバー上でレポートを受信できたので、以後の外部リダイレクトを閉じる。
+    state
+        .authentication_in_progress
+        .store(false, Ordering::Release);
     let rows = report.decision_count.clamp(1, 30);
     let requested_height = if report.image_count > 0 && report.content_height > 0 {
         report.content_height
@@ -791,6 +914,9 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         download_dir,
         quitting: AtomicBool::new(false),
         settings_opening: AtomicBool::new(false),
+        // 最初のローカル起動ページはRustがWebView生成時に指定している。
+        post_navigation_armed: AtomicBool::new(true),
+        authentication_in_progress: AtomicBool::new(true),
         decisions: AtomicUsize::new(0),
         decision_counter: AtomicUsize::new(1),
     });
@@ -828,7 +954,13 @@ fn handle_window_menu(window: &tauri::Window, id: &str) {
         }
         "reload" => {
             if let Some(webview) = app.get_webview_window(window.label()) {
-                let _ = webview.eval("window.location.reload()");
+                if window.label() == MAIN_LABEL {
+                    if let Some(state) = app.try_state::<Arc<AppState>>() {
+                        let _ = begin_portlet_load(&webview, &state);
+                    }
+                } else {
+                    let _ = webview.eval("window.location.reload()");
+                }
             }
         }
         "close" => {
@@ -910,7 +1042,11 @@ pub fn handle_shortcut(
 
 #[cfg(test)]
 mod tests {
-    use super::{has_allowed_origin, is_blocked_download, parse_report_title};
+    use super::{
+        build_portlet_endpoint, has_allowed_origin, is_blocked_download, is_portlet_bootstrap_url,
+        parse_report_title,
+    };
+    use crate::settings::Settings;
     use std::path::Path;
     use url::Url;
 
@@ -956,6 +1092,33 @@ mod tests {
         assert!(!has_allowed_origin(
             &Url::parse("file:///C:/temp/test.html").expect("URL"),
             allowed
+        ));
+    }
+
+    #[test]
+    fn builds_a_portlet_endpoint_without_credentials_in_the_url() {
+        let settings = Settings {
+            id: "TESTUSER".to_owned(),
+            cwf_address: "https://workflow.example/XFV20/portlet/wfportlet.jsp?old=value#fragment"
+                .to_owned(),
+            ..Settings::default()
+        };
+
+        let endpoint = build_portlet_endpoint(&settings).expect("endpoint");
+        assert_eq!(
+            endpoint.as_str(),
+            "https://workflow.example/XFV20/portlet/wfportlet.jsp"
+        );
+        assert!(!endpoint.as_str().contains(&settings.id));
+    }
+
+    #[test]
+    fn recognizes_only_the_local_post_bootstrap_page() {
+        assert!(is_portlet_bootstrap_url(
+            &Url::parse("http://tauri.localhost/portlet-bootstrap.html").expect("URL")
+        ));
+        assert!(!is_portlet_bootstrap_url(
+            &Url::parse("https://workflow.example/portlet-bootstrap.html").expect("URL")
         ));
     }
 }
