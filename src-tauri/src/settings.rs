@@ -214,14 +214,17 @@ pub fn read() -> io::Result<Option<Settings>> {
     Ok(Some(settings))
 }
 
-/// 検証済みの設定を、完成マーカーを最後に付ける順序で保存する。
-pub fn write(settings: &Settings) -> io::Result<()> {
+/// 検証済みの設定を、指定したキーへ完成マーカーを最後に付ける順序で保存する。
+///
+/// 本番とテストで同じ書き込み処理を使い、書き込む値がスナップショット対象から
+/// 漏れていないことをテスト用キーで確認できるようにする。
+fn write_at(path: &str, settings: &Settings) -> io::Result<()> {
     let settings = settings
         .clone()
         .normalize()
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (key, _) = hkcu.create_subkey_with_flags(REGISTRY_PATH, KEY_READ | KEY_WRITE)?;
+    let (key, _) = hkcu.create_subkey_with_flags(path, KEY_READ | KEY_WRITE)?;
 
     // 既存設定を更新する場合も、最初に完成マーカーを外す。
     // 途中のset_valueで失敗しても、次回起動時に半端な設定を採用しないためである。
@@ -240,6 +243,11 @@ pub fn write(settings: &Settings) -> io::Result<()> {
     // すべての値を書けた場合だけ、最後に完成マーカーを戻す。
     key.set_value(VALUE_SCHEMA_VERSION, &SCHEMA_VERSION)?;
     Ok(())
+}
+
+/// 検証済みの設定を、完成マーカーを最後に付ける順序で保存する。
+pub fn write(settings: &Settings) -> io::Result<()> {
+    write_at(REGISTRY_PATH, settings)
 }
 
 /// 保存した値をレジストリから読み直し、期待値と完全に一致するか調べる。
@@ -311,8 +319,8 @@ pub fn restore_snapshot(snapshot: &RegistrySnapshot) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        migration_version_completed, restore_snapshot_at, snapshot_at, Settings,
-        MAX_INTERVAL_MINUTES, SAML_ID,
+        migration_version_completed, restore_snapshot_at, snapshot_at, write_at, Settings,
+        MAX_INTERVAL_MINUTES, SAML_ID, SETTINGS_VALUE_NAMES,
     };
     use std::time::SystemTime;
     use winreg::{
@@ -425,6 +433,43 @@ mod tests {
         assert!(!migration_version_completed(0));
         assert!(migration_version_completed(1));
         assert!(migration_version_completed(2));
+    }
+
+    #[test]
+    fn every_written_registry_value_is_managed_by_snapshots() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let test_root = r"Software\KashiharaCity\CwfCheckerTests";
+        let path = format!(r"{test_root}\written-values-{}-{nonce}", std::process::id());
+        let settings = Settings {
+            id: "USER".to_owned(),
+            ad_server: "ADSERVER".to_owned(),
+            cwf_address: "https://workflow.example/XFV20/".to_owned(),
+            interval_minutes: 30,
+            notify_by_bar: true,
+            shortcut: "SHIFT+F2".to_owned(),
+        };
+
+        write_at(&path, &settings).expect("write settings to test key");
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let key = hkcu
+            .open_subkey_with_flags(&path, KEY_READ)
+            .expect("open test key");
+        let unmanaged: Vec<String> = key
+            .enum_values()
+            .map(|entry| entry.expect("enumerate written value").0)
+            .filter(|name| !SETTINGS_VALUE_NAMES.contains(&name.as_str()))
+            .collect();
+
+        assert!(
+            unmanaged.is_empty(),
+            "write_at wrote values missing from SETTINGS_VALUE_NAMES: {unmanaged:?}"
+        );
+        drop(key);
+        hkcu.delete_subkey_all(&path).expect("remove test key");
+        let _ = hkcu.delete_subkey(test_root);
     }
 
     #[test]
