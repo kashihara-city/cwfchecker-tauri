@@ -1,6 +1,8 @@
 (config) => {
   if (window.location.href !== config.bootstrapUrl) return;
 
+  // POST後に作られるCWF文書へ、この読込み世代をURLやPOST本文へ載せず引き継ぐ。
+  window.name = config.windowName;
   const form = document.createElement("form");
   form.method = "post";
   form.action = config.action;

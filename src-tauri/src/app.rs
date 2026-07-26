@@ -38,6 +38,8 @@ const PORTLET_BOOTSTRAP_URL: &str = "http://tauri.localhost/portlet-bootstrap.ht
 const EXTERNAL_AUTH_WINDOW: Duration = Duration::from_secs(30);
 const AUTHENTICATION_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
 const RELOAD_FALLBACK_DELAY: Duration = Duration::from_secs(5);
+const LOAD_GENERATION_PREFIX: &str = "__CWFCHECKER_LOAD__";
+const LOAD_GENERATION_STORAGE_KEY: &str = "__cwfcheckerLoadGeneration";
 const PORTLET_POST_SCRIPT: &str = include_str!("../scripts/portlet-post.js");
 const WEBVIEW_SCRIPT: &str = include_str!("../scripts/cwf-scan.js");
 /// ダウンロード直後にShellExecuteで開くと危険な、実行・スクリプト系の拡張子。
@@ -89,14 +91,20 @@ pub struct AppState {
 /// 単純なtrue/falseでは区別できないため、要求ごとに増える世代番号を使う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PortletLoadPhase {
+    /// Cookieを使う通常reloadの結果を、最大5秒待っている。
     Reloading,
+    /// reloadで認証できず、ローカルbootstrapから資格情報をPOSTしている。
     Posting,
+    /// 現在の文書で認証成功DOMを確認し、POSTフォールバックが不要になった。
     Complete,
 }
 
 struct PortletLoadState {
+    /// 更新要求のたびに増える番号。遅れて届いたイベントを無視するために使う。
     active_generation: usize,
+    /// 同じ世代で資格情報入りPOSTを二重実行しないための記録。
     posted_generation: Option<usize>,
+    /// 現在世代がreload・POST・完了のどこまで進んだかを表す。
     phase: PortletLoadPhase,
 }
 
@@ -128,8 +136,12 @@ impl PortletLoadState {
     }
 
     /// 現在の世代で認証成功DOMを確認し、待機中のフォールバックを無効にする。
-    fn mark_authenticated(&mut self) {
+    fn mark_authenticated(&mut self, generation: usize) -> bool {
+        if !self.is_active(generation) {
+            return false;
+        }
         self.phase = PortletLoadPhase::Complete;
+        true
     }
 
     /// 最新世代のPOST実行権を一度だけ取得する。
@@ -147,7 +159,7 @@ impl PortletLoadState {
 #[derive(Clone, Copy)]
 /// SAML認証中に、設定先以外のHTTPSへ移動できる期限を管理する。
 struct AuthenticationState {
-    /// ポートレットPOSTから認証結果の受信までの間だけtrueになる。
+    /// ポートレットのreloadまたはPOSTから認証結果の受信までの間だけtrueになる。
     in_progress: bool,
     /// 認証開始から数えて、この時刻を過ぎた外部遷移は最初の1回でも許可しない。
     attempt_deadline: Option<Instant>,
@@ -219,6 +231,27 @@ impl AuthenticationState {
     }
 }
 
+/// DOMレポートが現在の文書世代に属する場合だけ、読込み・認証状態へ反映する。
+fn apply_page_report_state(
+    load: &mut PortletLoadState,
+    authentication: &mut AuthenticationState,
+    generation: usize,
+    authenticated: bool,
+) -> bool {
+    if authenticated {
+        if !load.mark_authenticated(generation) {
+            return false;
+        }
+        authentication.finish();
+    } else {
+        if !load.is_active(generation) {
+            return false;
+        }
+        authentication.close_external_navigation();
+    }
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// 設定画面からTauriコマンドへ渡される入力。PWは保存済み設定には含めない。
@@ -248,6 +281,8 @@ pub struct SettingsView {
 #[derive(Debug)]
 /// WebView内のJavaScriptがページを調査した結果。
 pub struct PageReport {
+    /// このレポートを作った文書の更新世代。
+    generation: usize,
     decision_count: usize,
     auth_count: usize,
     image_count: usize,
@@ -339,7 +374,31 @@ fn portlet_load_generation(url: &Url) -> Option<usize> {
 /// IDとPWはURLへ連結せず、`application/x-www-form-urlencoded`のPOST本文として
 /// WebView2から送信する。JSON文字列化により、引用符などをJavaScriptとして
 /// 解釈させない。
-fn portlet_post_script(state: &AppState, bootstrap_url: &str) -> Result<String, String> {
+fn load_generation_window_name(generation: usize) -> String {
+    format!("{LOAD_GENERATION_PREFIX}{generation}")
+}
+
+/// 次の文書へ世代印を渡してから、現在ページを通常reloadするJavaScriptを作る。
+fn portlet_reload_script(generation: usize) -> Result<String, String> {
+    // CWFのsessionStorageは同一タブでIdPへ往復しても残る。window.nameは
+    // bootstrapからCWFへ遷移する初回POSTでも印を渡すための補助として使う。
+    let generation_text =
+        serde_json::to_string(&generation.to_string()).map_err(|error| error.to_string())?;
+    let window_name = serde_json::to_string(&load_generation_window_name(generation))
+        .map_err(|error| error.to_string())?;
+    let storage_key =
+        serde_json::to_string(LOAD_GENERATION_STORAGE_KEY).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "try {{ sessionStorage.setItem({storage_key}, {generation_text}); }} catch {{}} \
+         window.name = {window_name}; window.location.reload();"
+    ))
+}
+
+fn portlet_post_script(
+    state: &AppState,
+    bootstrap_url: &str,
+    generation: usize,
+) -> Result<String, String> {
     let settings = settings_snapshot(state)?;
     let credential = credentials::read(credentials::TARGET)
         .map_err(|error| error.to_string())?
@@ -350,6 +409,7 @@ fn portlet_post_script(state: &AppState, bootstrap_url: &str) -> Result<String, 
 
     let config = serde_json::json!({
         "bootstrapUrl": bootstrap_url,
+        "windowName": load_generation_window_name(generation),
         "action": build_portlet_endpoint(&settings)?.as_str(),
         "fields": [
             ["view", "recv"],
@@ -409,8 +469,10 @@ fn begin_portlet_load(window: &WebviewWindow, state: Arc<AppState>) -> Result<()
             .lock()
             .map_err(|_| lock_error())?
             .begin(Instant::now());
-        // reloadはon_navigationを同期的に呼ぶ可能性があるため、各状態のガードは手放しておく。
-        (generation, window.reload())
+        // 古い文書のスキャナーは生成時に以前の世代を控えているため、
+        // 次の世代印を書いても、遅れて届く旧レポートの番号は変わらない。
+        let reload_script = portlet_reload_script(generation)?;
+        (generation, window.eval(&reload_script))
     };
     if let Err(error) = reload_result {
         eprintln!("通常reloadを開始できなかったためPOSTへ切り替えます: {error}");
@@ -445,8 +507,12 @@ fn finish_authentication_if_active_load(state: &AppState, generation: usize) {
 fn webview_script(origin: &str) -> String {
     // 値を手作業で引用符へ入れずJSON化することで、URL中の記号をJSコードとして
     // 解釈させない。静的な処理本体は別ファイルなので通常のJSとして編集できる。
-    let origin = serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".to_owned());
-    format!("({WEBVIEW_SCRIPT})({origin});")
+    let config = serde_json::json!({
+        "allowedOrigin": origin,
+        "generationPrefix": LOAD_GENERATION_PREFIX,
+        "generationStorageKey": LOAD_GENERATION_STORAGE_KEY,
+    });
+    format!("({WEBVIEW_SCRIPT})({config});")
 }
 
 fn cache_root() -> PathBuf {
@@ -748,7 +814,7 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
                 .lock()
                 .is_ok_and(|mut load| load.claim_post(generation));
             if should_post {
-                match portlet_post_script(&state_for_page_load, current_url.as_str()) {
+                match portlet_post_script(&state_for_page_load, current_url.as_str(), generation) {
                     Ok(script) => {
                         if let Err(error) = window.eval(&script) {
                             finish_authentication_if_active_load(&state_for_page_load, generation);
@@ -1027,7 +1093,8 @@ pub fn save_settings(
 }
 
 fn parse_report_title(title: &str) -> Option<PageReport> {
-    let mut parts = title.strip_prefix("__CWFCHECKER_REPORT__|")?.splitn(5, '|');
+    let mut parts = title.strip_prefix("__CWFCHECKER_REPORT__|")?.splitn(6, '|');
+    let generation: usize = parts.next()?.parse().ok()?;
     let decision_count: usize = parts.next()?.parse().ok()?;
     let auth_count: usize = parts.next()?.parse().ok()?;
     let image_count: usize = parts.next()?.parse().ok()?;
@@ -1045,6 +1112,7 @@ fn parse_report_title(title: &str) -> Option<PageReport> {
         count_text = decision_count.to_string();
     }
     Some(PageReport {
+        generation,
         decision_count,
         auth_count,
         image_count,
@@ -1073,25 +1141,20 @@ fn process_page_report(
     if actual != expected {
         return Err("許可されていないオリジンです。".to_owned());
     }
-    if report.auth_count > 0 {
-        // 認証成功DOMを確認できた世代では、5秒タイマーからPOSTへ切り替えない。
-        state
-            .portlet_load
-            .lock()
-            .map_err(|_| lock_error())?
-            .mark_authenticated();
-        state
-            .authentication
-            .lock()
-            .map_err(|_| lock_error())?
-            .finish();
-    } else {
-        // 同一オリジンのエラー画面等では外部遷移だけ閉じ、POSTへ引き継ぐ絶対期限は残す。
-        state
-            .authentication
-            .lock()
-            .map_err(|_| lock_error())?
-            .close_external_navigation();
+    {
+        // 世代確認と認証状態の更新を同じ区間で行い、確認直後に始まった
+        // 新しいreloadを古い文書のレポートで変更しない。
+        let mut load = state.portlet_load.lock().map_err(|_| lock_error())?;
+        let mut authentication = state.authentication.lock().map_err(|_| lock_error())?;
+        // 認証成功なら5秒タイマーを止め、未認証なら外部遷移だけ閉じる。
+        if !apply_page_report_state(
+            &mut load,
+            &mut authentication,
+            report.generation,
+            report.auth_count > 0,
+        ) {
+            return Ok(());
+        }
     }
     let rows = report.decision_count.clamp(1, 30);
     let requested_height = if report.image_count > 0 && report.content_height > 0 {
@@ -1292,10 +1355,11 @@ pub fn handle_shortcut(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_portlet_endpoint, can_download_from_page, cleanup_directory, has_allowed_origin,
-        is_blocked_download, is_managed_download, is_portlet_bootstrap_url, parse_report_title,
-        portlet_bootstrap_url, portlet_load_generation, webview_script, AuthenticationState,
-        PortletLoadPhase, PortletLoadState, AUTHENTICATION_ATTEMPT_WINDOW, EXTERNAL_AUTH_WINDOW,
+        apply_page_report_state, build_portlet_endpoint, can_download_from_page, cleanup_directory,
+        has_allowed_origin, is_blocked_download, is_managed_download, is_portlet_bootstrap_url,
+        parse_report_title, portlet_bootstrap_url, portlet_load_generation, portlet_reload_script,
+        webview_script, AuthenticationState, PortletLoadPhase, PortletLoadState,
+        AUTHENTICATION_ATTEMPT_WINDOW, EXTERNAL_AUTH_WINDOW, LOAD_GENERATION_PREFIX,
         NOTIFICATION_TITLE, PORTLET_POST_SCRIPT,
     };
     use crate::settings::Settings;
@@ -1308,8 +1372,10 @@ mod tests {
 
     #[test]
     fn parses_rendered_content_height() {
-        let report = parse_report_title("__CWFCHECKER_REPORT__|3|1|2|746|3").expect("valid report");
+        let report =
+            parse_report_title("__CWFCHECKER_REPORT__|42|3|1|2|746|3").expect("valid report");
 
+        assert_eq!(report.generation, 42);
         assert_eq!(report.decision_count, 3);
         assert_eq!(report.auth_count, 1);
         assert_eq!(report.image_count, 2);
@@ -1320,7 +1386,7 @@ mod tests {
     #[test]
     fn sanitizes_text_received_through_the_document_title() {
         let long_text = format!("{}\nignored", "9".repeat(40));
-        let title = format!("__CWFCHECKER_REPORT__|3|0|0|0|{long_text}");
+        let title = format!("__CWFCHECKER_REPORT__|7|3|0|0|0|{long_text}");
         let report = parse_report_title(&title).expect("valid report");
 
         assert_eq!(report.count_text, "9".repeat(32));
@@ -1329,9 +1395,14 @@ mod tests {
     #[test]
     fn generated_script_reports_each_document_only_once() {
         let script = webview_script("https://workflow.example");
+        let reload_script = portlet_reload_script(42).expect("reload script");
 
         assert!(script.contains("window.__cwfScanRunning || window.__cwfScanReported"));
         assert!(script.contains("window.__cwfScanReported = true;"));
+        assert!(script.contains(LOAD_GENERATION_PREFIX));
+        assert!(reload_script.contains("\"42\""));
+        assert!(reload_script.contains("window.location.reload()"));
+        assert!(PORTLET_POST_SCRIPT.contains("window.name = config.windowName"));
         assert!(PORTLET_POST_SCRIPT.contains("form.submit()"));
     }
 
@@ -1548,15 +1619,37 @@ mod tests {
 
     #[test]
     fn authentication_report_stops_the_reload_fallback() {
+        let start = Instant::now();
         let mut load = PortletLoadState {
             active_generation: 12,
             posted_generation: Some(11),
             phase: PortletLoadPhase::Reloading,
         };
+        let mut authentication = AuthenticationState {
+            in_progress: true,
+            attempt_deadline: Some(start + AUTHENTICATION_ATTEMPT_WINDOW),
+            external_deadline: None,
+        };
 
-        load.mark_authenticated();
+        // 古い文書の未認証レポートは、新しい世代の外部遷移許可を閉じない。
+        assert!(!apply_page_report_state(
+            &mut load,
+            &mut authentication,
+            11,
+            false
+        ));
+        assert!(authentication.in_progress);
+        assert_eq!(load.phase, PortletLoadPhase::Reloading);
+        // 現在世代の認証成功だけが、フォールバックと認証試行を終了する。
+        assert!(apply_page_report_state(
+            &mut load,
+            &mut authentication,
+            12,
+            true
+        ));
 
         assert_eq!(load.phase, PortletLoadPhase::Complete);
+        assert!(!authentication.in_progress);
         assert!(!load.begin_post_fallback(12));
     }
 

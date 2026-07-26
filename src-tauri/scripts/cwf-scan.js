@@ -1,6 +1,21 @@
-(allowedOrigin) => {
+(config) => {
   // iframeや想定外サーバーでは、ページ内容の読取りやRust側への報告を行わない。
-  if (window.top !== window || window.location.origin !== allowedOrigin) return;
+  if (window.top !== window || window.location.origin !== config.allowedOrigin) return;
+
+  // 文書生成時の世代を固定する。次のreloadがwindow.nameを書き換えた後に
+  // この文書の非同期スキャンが完了しても、新しい世代を誤って名乗らない。
+  const windowNameGeneration = window.name.startsWith(config.generationPrefix)
+    ? window.name.slice(config.generationPrefix.length)
+    : "";
+  let storedGeneration = "";
+  // sessionStorageを使えない特殊なページでも、DOM調査そのものは止めない。
+  try { storedGeneration = sessionStorage.getItem(config.generationStorageKey) || ""; } catch {}
+  const isGeneration = value => /^\d+$/.test(value);
+  // 初回POSTでは保存値がまだないため、WebView生成時の世代1を既定値にする。
+  const loadGeneration = isGeneration(windowNameGeneration)
+    ? windowNameGeneration
+    : (isGeneration(storedGeneration) ? storedGeneration : "1");
+  try { sessionStorage.setItem(config.generationStorageKey, loadGeneration); } catch {}
 
   const imageCandidates = [
     "cwfchecker_footer01.jpg", "cwfchecker_footer02.jpg",
@@ -77,7 +92,7 @@
       // 外部ページにはTauri IPCを公開しないため、一時的なdocument.titleを
       // 最小限の通信路として使う。Rust側でもウィンドウ名とoriginを再検証する。
       window.__cwfScanReported = true;
-      document.title = `__CWFCHECKER_REPORT__|${decisionCount}|${authCount}|${images.length}|${contentHeight}|${countText.replaceAll("|", "")}`;
+      document.title = `__CWFCHECKER_REPORT__|${loadGeneration}|${decisionCount}|${authCount}|${images.length}|${contentHeight}|${countText.replaceAll("|", "")}`;
       await new Promise(resolve => setTimeout(resolve, 0));
       document.title = previousTitle;
     } finally {
