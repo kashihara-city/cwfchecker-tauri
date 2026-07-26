@@ -129,6 +129,9 @@ fn configured_url(state: &AppState) -> Result<Option<Url>, String> {
     if settings.cwf_address.is_empty() || settings.id.is_empty() {
         return Ok(None);
     }
+    if settings.uses_saml() {
+        return build_portlet_endpoint(&settings).map(Some);
+    }
     let Some(credential) =
         credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
     else {
@@ -168,9 +171,13 @@ pub fn get_settings(
         return Err("許可されていないウィンドウです。".to_owned());
     }
     let settings = settings_snapshot(&state)?;
-    let has_password = credentials::read(credentials::TARGET)
-        .map_err(|error| error.to_string())?
-        .is_some_and(|credential| credential.username == settings.id);
+    let has_password = if settings.uses_saml() {
+        false
+    } else {
+        credentials::read(credentials::TARGET)
+            .map_err(|error| error.to_string())?
+            .is_some_and(|credential| credential.username == settings.id)
+    };
     Ok(SettingsView {
         id: settings.id,
         ad_server: settings.ad_server,
@@ -210,28 +217,39 @@ pub fn save_settings(
     let previous_settings = settings_snapshot(&state)?;
     let previous_registry = state.settings_persisted.load(Ordering::Acquire);
 
-    // 保存済みPWはWebViewへ返さず、空欄で送られた場合だけRust側で引き継ぐ。
-    let existing = credentials::read(credentials::TARGET).map_err(|error| error.to_string())?;
-    let password = if input.password.is_empty() {
-        let existing = existing
-            .as_ref()
-            .ok_or_else(|| "PWを入力してください。".to_owned())?;
-        if existing.username != settings.id {
-            return Err("IDを変更する場合はPWも入力してください。".to_owned());
-        }
-        existing.password.clone()
+    // SAMLでは固定のPOST値を実行時に生成し、資格情報マネージャーへは保存しない。
+    // 通常認証では保存済みPWをWebViewへ返さず、空欄ならRust側で引き継ぐ。
+    let wrote_credential = !settings.uses_saml();
+    let existing = if wrote_credential {
+        credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
     } else {
-        input.password
+        None
     };
-    credentials::write(credentials::TARGET, &settings.id, &password)
-        .map_err(|error| error.to_string())?;
-    // Windows APIが成功を返しても、実際に同じ内容を読めることまで確認する。
-    let verified = credentials::read(credentials::TARGET)
-        .map_err(|error| error.to_string())?
-        .is_some_and(|value| value.username == settings.id && value.password == password);
-    if !verified {
-        let _ = credentials::restore(existing.as_ref());
-        return Err("Windows資格情報の保存後検証に失敗しました。".to_owned());
+    if wrote_credential {
+        let password = if input.password.is_empty() {
+            let existing = existing
+                .as_ref()
+                .ok_or_else(|| "PWを入力してください。".to_owned())?;
+            if existing.username != settings.id {
+                return Err("IDを変更する場合はPWも入力してください。".to_owned());
+            }
+            existing.password.clone()
+        } else {
+            input.password
+        };
+        credentials::write(credentials::TARGET, &settings.id, &password)
+            .map_err(|error| error.to_string())?;
+        // Windows APIが成功を返しても、実際に同じ内容を読めることまで確認する。
+        let verified = credentials::read(credentials::TARGET)
+            .map_err(|error| error.to_string())?
+            .is_some_and(|value| value.username == settings.id && value.password == password);
+        if !verified {
+            let _ = credentials::restore(existing.as_ref());
+            return Err("Windows資格情報の保存後検証に失敗しました。".to_owned());
+        }
+    } else {
+        // 入力欄に値が残っていても、予約IDの疑似PWとして永続化しない。
+        drop(input.password);
     }
 
     let registry_result = (|| -> Result<(), String> {
@@ -263,14 +281,14 @@ pub fn save_settings(
             registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
             settings::restore(previous_registry.then_some(&previous_settings)),
         );
-        let credential_rollback = credentials::restore(existing.as_ref());
+        let credential_rollback = wrote_credential.then(|| credentials::restore(existing.as_ref()));
         let mut message = error;
         if let Err(rollback_error) = registry_rollback {
             message.push_str(&format!(
                 "\nアプリ設定を変更前の状態へ戻せませんでした: {rollback_error}"
             ));
         }
-        if let Err(rollback_error) = credential_rollback {
+        if let Some(Err(rollback_error)) = credential_rollback {
             message.push_str(&format!(
                 "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
             ));

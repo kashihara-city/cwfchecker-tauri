@@ -88,36 +88,73 @@ fn with_rollback_errors(
     }
 }
 
+/// 旧設定を基本にしつつ、既に完成している有効なCWFAddressだけは上書きしない。
+fn merged_legacy_settings(
+    legacy: &LegacySettings,
+    existing: Option<&Settings>,
+) -> Result<Settings, String> {
+    let preserved_cwf_address = existing
+        .map(|settings| settings.cwf_address.trim())
+        .filter(|address| !address.is_empty());
+    Settings {
+        id: legacy.id.trim().to_owned(),
+        ad_server: legacy.ad.trim().to_owned(),
+        cwf_address: preserved_cwf_address
+            .unwrap_or_else(|| legacy.cwfaddress.trim())
+            .to_owned(),
+        interval_minutes: interval(&legacy.interval),
+        notify_by_bar: legacy.notifybybar,
+        shortcut: if legacy.shortcut.trim().is_empty() {
+            "F3".to_owned()
+        } else {
+            legacy.shortcut.trim().to_owned()
+        },
+    }
+    .normalize()
+}
+
+/// 同じIDについて複数世代のPWが残っている場合の優先順位を一か所に固定する。
+fn preferred_password(
+    encrypted_json: Option<String>,
+    legacy_keytar: Option<String>,
+    current: Option<String>,
+) -> Option<String> {
+    encrypted_json.or(legacy_keytar).or(current)
+}
+
+fn should_migrate_password(settings: &Settings) -> bool {
+    !settings.id.is_empty() && !settings.uses_saml()
+}
+
 /// 現行設定を読み、存在しなければ旧Electron版から移行する。
 pub fn load_or_migrate() -> io::Result<LoadedSettings> {
-    let existing = registry_support::report_io(
+    let existing_result = registry_support::report_io(
         "アプリ設定の読み込み",
         registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
         settings::read(),
     );
-    match existing {
-        Ok(Some(settings)) => {
-            return Ok(LoadedSettings {
-                settings,
-                persisted: true,
-            });
-        }
-        Ok(None) => {}
-        // 現行キーが存在するのに内容が不正な場合は旧版を再移行せず、
-        // 安全な初期値から設定画面で修復してもらう。
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-            return Ok(LoadedSettings {
-                settings: Settings::default(),
-                persisted: false,
-            });
-        }
+    let existing = match existing_result {
+        Ok(settings) => settings,
+        // 旧設定があれば後で修復に使用する。なければ安全な初期値から設定してもらう。
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
         Err(error) => return Err(error),
+    };
+    let migration_completed = registry_support::report_io(
+        "旧設定の移行状態の読み込み",
+        registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+        settings::legacy_migration_completed(),
+    )?;
+    if migration_completed {
+        return Ok(LoadedSettings {
+            persisted: existing.is_some(),
+            settings: existing.unwrap_or_default(),
+        });
     }
 
     let Some(path) = legacy_config_path().filter(|path| path.is_file()) else {
         return Ok(LoadedSettings {
-            settings: Settings::default(),
-            persisted: false,
+            persisted: existing.is_some(),
+            settings: existing.unwrap_or_default(),
         });
     };
     if fs::metadata(&path)?.len() > MAX_LEGACY_CONFIG_SIZE {
@@ -128,49 +165,48 @@ pub fn load_or_migrate() -> io::Result<LoadedSettings> {
     }
     let legacy: LegacySettings = serde_json::from_slice(&fs::read(&path)?)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let settings = Settings {
-        id: legacy.id.trim().to_owned(),
-        ad_server: legacy.ad.trim().to_owned(),
-        cwf_address: legacy.cwfaddress.trim().to_owned(),
-        interval_minutes: interval(&legacy.interval),
-        notify_by_bar: legacy.notifybybar,
-        shortcut: if legacy.shortcut.trim().is_empty() {
-            "F3".to_owned()
-        } else {
-            legacy.shortcut.trim().to_owned()
-        },
-    }
-    .normalize()
-    .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+    let migrated = merged_legacy_settings(&legacy, existing.as_ref())
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
 
-    // 現行ターゲットに別IDの資格情報が残っていても、そのパスワードを新しいIDへ
-    // 誤って流用しない。IDが一致しなければ旧keytar、次にsafeStorageを試す。
-    let current = credentials::read(credentials::TARGET)?;
+    // JSON内のsafeStorageを最優先し、なければ旧keytar、最後に同じIDの現行資格情報を
+    // 使用する。別IDの現行資格情報を誤って流用しない。
+    let migrate_password = should_migrate_password(&migrated);
+    let current = if migrate_password {
+        credentials::read(credentials::TARGET)?
+    } else {
+        None
+    };
     let current_password = current
         .as_ref()
-        .filter(|credential| credential.username == settings.id)
+        .filter(|credential| credential.username == migrated.id)
         .map(|credential| credential.password.clone());
-    let legacy_password = if current_password.is_none() && !settings.id.is_empty() {
-        credentials::read(&credentials::legacy_target(&settings.id))?
+    let encrypted_password = if migrate_password {
+        legacy
+            .encpw
+            .as_deref()
+            .map(credentials::decrypt_electron_safe_storage)
+            .transpose()?
+    } else {
+        None
+    };
+    let legacy_password = if migrate_password && encrypted_password.is_none() {
+        credentials::read(&credentials::legacy_target(&migrated.id))?
             .map(|credential| credential.password)
     } else {
         None
     };
-    let password = match (
-        current_password.or(legacy_password),
-        legacy.encpw.as_deref(),
-    ) {
-        (some @ Some(_), _) => some,
-        (None, Some(encrypted)) => Some(credentials::decrypt_electron_safe_storage(encrypted)?),
-        (None, None) => None,
+    let password = if migrate_password {
+        preferred_password(encrypted_password, legacy_password, current_password)
+    } else {
+        None
     };
 
     // 後のレジストリ移行が失敗した場合、ここで書いた時だけ資格情報を復元する。
     let wrote_credential = password.is_some();
     if let Some(password) = password {
-        credentials::write(credentials::TARGET, &settings.id, &password)?;
+        credentials::write(credentials::TARGET, &migrated.id, &password)?;
         let verified = credentials::read(credentials::TARGET)?
-            .is_some_and(|actual| actual.username == settings.id && actual.password == password);
+            .is_some_and(|actual| actual.username == migrated.id && actual.password == password);
         if !verified {
             let _ = credentials::restore(current.as_ref());
             return Err(io::Error::other(
@@ -183,23 +219,27 @@ pub fn load_or_migrate() -> io::Result<LoadedSettings> {
         registry_support::report_io(
             "旧Electron版設定の移行",
             registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            settings::write(&settings),
+            settings::write(&migrated),
         )?;
         let verified = registry_support::report_io(
             "移行した設定の保存後確認",
             registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            settings::verify(&settings),
+            settings::verify(&migrated),
         )?;
         registry_support::require_verified(
             "移行した設定の保存後確認",
             registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
             verified,
+        )?;
+        registry_support::report_io(
+            "旧設定の移行済みマーカーの保存",
+            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+            settings::mark_legacy_migrated(),
         )
     })();
     if let Err(error) = registry_result {
-        // 現行設定がなかった場合だけ移行へ来るので、レジストリ側はキーなしへ戻す。
         // 2個の復元は先に両方実行し、一方の失敗で他方を試さない状態を避ける。
-        let registry_rollback = settings::restore(None);
+        let registry_rollback = settings::restore(existing.as_ref());
         let credential_rollback = wrote_credential.then(|| credentials::restore(current.as_ref()));
         return Err(with_rollback_errors(
             error,
@@ -211,14 +251,19 @@ pub fn load_or_migrate() -> io::Result<LoadedSettings> {
     // 読み返しで分かるのは保存データの一致まで。旧JSONと旧資格情報は、
     // Create!Webフロー側で認証成功を確認するまで残す。
     Ok(LoadedSettings {
-        settings,
+        settings: migrated,
         persisted: true,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::with_rollback_errors;
+    use super::{
+        merged_legacy_settings, preferred_password, should_migrate_password, with_rollback_errors,
+        LegacySettings,
+    };
+    use crate::settings::Settings;
+    use serde_json::json;
     use std::io;
 
     #[test]
@@ -244,5 +289,70 @@ mod tests {
 
         assert!(message.contains("registry failed"));
         assert!(message.contains("credential failed"));
+    }
+
+    #[test]
+    fn preserves_an_existing_cwf_address_when_migrating_legacy_settings() {
+        let existing = Settings {
+            cwf_address: "https://gpo.example/XFV20/".to_owned(),
+            ..Settings::default()
+        };
+        let legacy = LegacySettings {
+            id: "legacy-user".to_owned(),
+            cwfaddress: "https://legacy.example/XFV20/".to_owned(),
+            interval: json!("20"),
+            ..LegacySettings::default()
+        };
+
+        let merged = merged_legacy_settings(&legacy, Some(&existing)).expect("merge");
+
+        assert_eq!(merged.id, "legacy-user");
+        assert_eq!(merged.cwf_address, "https://gpo.example/XFV20/");
+        assert_eq!(merged.interval_minutes, 20);
+    }
+
+    #[test]
+    fn uses_the_legacy_address_when_no_existing_address_is_configured() {
+        let legacy = LegacySettings {
+            cwfaddress: "https://legacy.example/XFV20/".to_owned(),
+            ..LegacySettings::default()
+        };
+
+        let merged = merged_legacy_settings(&legacy, None).expect("merge");
+
+        assert_eq!(merged.cwf_address, "https://legacy.example/XFV20/");
+    }
+
+    #[test]
+    fn prefers_encrypted_json_then_keytar_then_current_password() {
+        assert_eq!(
+            preferred_password(
+                Some("json".to_owned()),
+                Some("keytar".to_owned()),
+                Some("current".to_owned())
+            ),
+            Some("json".to_owned())
+        );
+        assert_eq!(
+            preferred_password(None, Some("keytar".to_owned()), Some("current".to_owned())),
+            Some("keytar".to_owned())
+        );
+        assert_eq!(
+            preferred_password(None, None, Some("current".to_owned())),
+            Some("current".to_owned())
+        );
+    }
+
+    #[test]
+    fn does_not_migrate_a_password_for_an_empty_or_saml_id() {
+        assert!(!should_migrate_password(&Settings::default()));
+        assert!(!should_migrate_password(&Settings {
+            id: crate::settings::SAML_ID.to_owned(),
+            ..Settings::default()
+        }));
+        assert!(should_migrate_password(&Settings {
+            id: "normal-user".to_owned(),
+            ..Settings::default()
+        }));
     }
 }

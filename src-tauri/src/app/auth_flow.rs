@@ -7,7 +7,11 @@ use super::{
     build_portlet_endpoint, configured_origin, lock_error, settings_snapshot,
     show_windows_notification, AppState, MAIN_LABEL, NOTIFICATION_TITLE,
 };
-use crate::{credentials, migration};
+use crate::{
+    credentials::{self, Credential},
+    migration,
+    settings::{Settings, SAML_ID},
+};
 use std::{
     fs,
     sync::Arc,
@@ -251,6 +255,21 @@ fn load_generation_window_name(generation: usize) -> String {
     format!("{LOAD_GENERATION_PREFIX}{generation}")
 }
 
+/// SAMLでは疑似ID/PWを実行時だけ生成し、Windows資格情報を要求しない。
+fn post_credential(settings: &Settings, stored: Option<Credential>) -> Result<Credential, String> {
+    if settings.uses_saml() {
+        return Ok(Credential {
+            username: SAML_ID.to_owned(),
+            password: SAML_ID.to_owned(),
+        });
+    }
+    let credential = stored.ok_or_else(|| "PWが保存されていません。".to_owned())?;
+    if credential.username != settings.id {
+        return Err("設定中のIDと保存済みPWのIDが一致しません。".to_owned());
+    }
+    Ok(credential)
+}
+
 /// 次の文書へ世代印を渡してから、現在ページを通常reloadするJavaScriptを作る。
 fn portlet_reload_script(generation: usize) -> Result<String, String> {
     // CWFのsessionStorageは同一タブでIdPへ往復しても残る。window.nameは
@@ -273,12 +292,12 @@ pub(super) fn portlet_post_script(
     generation: usize,
 ) -> Result<String, String> {
     let settings = settings_snapshot(state)?;
-    let credential = credentials::read(credentials::TARGET)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "PWが保存されていません。".to_owned())?;
-    if credential.username != settings.id {
-        return Err("設定中のIDと保存済みPWのIDが一致しません。".to_owned());
-    }
+    let stored = if settings.uses_saml() {
+        None
+    } else {
+        credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
+    };
+    let credential = post_credential(&settings, stored)?;
 
     let config = serde_json::json!({
         "bootstrapUrl": bootstrap_url,
@@ -527,6 +546,43 @@ mod tests {
         assert_eq!(report.image_count, 2);
         assert_eq!(report.content_height, 746);
         assert_eq!(report.count_text, "3");
+    }
+
+    #[test]
+    fn synthesizes_saml_post_values_without_a_stored_credential() {
+        let settings = Settings {
+            id: SAML_ID.to_owned(),
+            cwf_address: "https://workflow.example/XFV20/".to_owned(),
+            ..Settings::default()
+        };
+
+        let credential = post_credential(&settings, None).expect("SAML credential");
+
+        assert_eq!(credential.username, SAML_ID);
+        assert_eq!(credential.password, SAML_ID);
+    }
+
+    #[test]
+    fn requires_a_matching_credential_for_a_normal_id() {
+        let settings = Settings {
+            id: "normal-user".to_owned(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            post_credential(&settings, None).expect_err("missing password"),
+            "PWが保存されていません。"
+        );
+        assert_eq!(
+            post_credential(
+                &settings,
+                Some(Credential {
+                    username: "another-user".to_owned(),
+                    password: "secret".to_owned(),
+                })
+            )
+            .expect_err("different ID"),
+            "設定中のIDと保存済みPWのIDが一致しません。"
+        );
     }
 
     #[test]

@@ -12,6 +12,9 @@ use winreg::{
 
 pub const REGISTRY_PATH: &str = r"Software\KashiharaCity\CwfChecker";
 const SCHEMA_VERSION: u32 = 1;
+const LEGACY_MIGRATION_VERSION: u32 = 1;
+const LEGACY_MIGRATION_VALUE: &str = "LegacyMigrationVersion";
+pub const SAML_ID: &str = "SAML";
 
 /// Rust内部と設定画面のJavaScriptで共有する、パスワード以外の設定。
 ///
@@ -41,6 +44,11 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// `SAML`は実在する資格情報ではなく、CWF側でSAMLを開始するための予約ID。
+    pub fn uses_saml(&self) -> bool {
+        self.id == SAML_ID
+    }
+
     /// 余分な空白を除去し、保存してよい値かを検証する。
     ///
     /// この関数を読み書きの境界で必ず通すことで、レジストリ、メモリ、
@@ -81,6 +89,44 @@ impl Settings {
             }
         }
         Ok(self)
+    }
+}
+
+/// 旧設定を既に永続化したかを、旧ファイルとは独立したマーカーで判定する。
+///
+/// 旧ファイルはCWFでの認証成功まで残すため、ファイルの有無だけでは再起動時に
+/// 同じ移行を繰り返してしまう。
+pub fn legacy_migration_completed() -> io::Result<bool> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = match hkcu.open_subkey_with_flags(REGISTRY_PATH, KEY_READ) {
+        Ok(key) => key,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match key.get_value::<u32, _>(LEGACY_MIGRATION_VALUE) {
+        Ok(version) => Ok(version == LEGACY_MIGRATION_VERSION),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// 旧設定の永続化が完了した最後に、一度限りの移行マーカーを保存する。
+pub fn mark_legacy_migrated() -> io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey_with_flags(REGISTRY_PATH, KEY_READ | KEY_WRITE)?;
+    key.set_value(LEGACY_MIGRATION_VALUE, &LEGACY_MIGRATION_VERSION)?;
+    match key.get_value::<u32, _>(LEGACY_MIGRATION_VALUE) {
+        Ok(version) if version == LEGACY_MIGRATION_VERSION => Ok(()),
+        Ok(_) => {
+            let _ = key.delete_value(LEGACY_MIGRATION_VALUE);
+            Err(io::Error::other(
+                "旧設定の移行済みマーカーが保存値と一致しません。",
+            ))
+        }
+        Err(error) => {
+            let _ = key.delete_value(LEGACY_MIGRATION_VALUE);
+            Err(error)
+        }
     }
 }
 
@@ -182,7 +228,7 @@ pub fn restore(previous: Option<&Settings>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Settings;
+    use super::{Settings, SAML_ID};
 
     #[test]
     fn accepts_shortcut_with_plus_separator() {
@@ -232,5 +278,17 @@ mod tests {
         assert_eq!(settings.cwf_address, "https://workflow.example/XFV20/");
         assert_eq!(settings.interval_minutes, 15);
         assert_eq!(settings.shortcut, "F3");
+    }
+
+    #[test]
+    fn recognizes_only_the_reserved_saml_id() {
+        let mut settings = Settings {
+            id: SAML_ID.to_owned(),
+            ..Settings::default()
+        };
+        assert!(settings.uses_saml());
+
+        settings.id = "saml".to_owned();
+        assert!(!settings.uses_saml());
     }
 }

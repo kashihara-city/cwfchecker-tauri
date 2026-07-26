@@ -81,6 +81,7 @@ HKEY_CURRENT_USER\Software\KashiharaCity\CwfChecker
 | `NotifyByBar`     | ポップアップせず通知バーでお知らせ | 案件発見時にメイン画面ではなくWindows通知を表示 | 初期値OFF            |
 | `Shortcut`        | ショートカットキー                 | 表示・非表示を切り替えるキー                    | 初期値`F3`           |
 | `SchemaVersion`   | ―                                  | 設定形式のバージョン                            | アプリが自動設定     |
+| `LegacyMigrationVersion` | ―                           | 旧設定を一度だけ移行したことを示すマーカー      | 移行時に自動設定     |
 
 複数キーのショートカットは`SHIFT+F2`のように、修飾キーとキーを`+`で区切ります。
 
@@ -122,6 +123,42 @@ Windows資格情報マネージャーの汎用資格情報として保存しま�
 保存にはWindowsのCredential APIを使用し、保存直後に読み返して内容を確認します。
 設定画面でPWを空欄にした場合は保存済みPWを維持します。
 IDを変更する場合はPWの再入力が必要です。
+IDを`SAML`にした場合は資格情報を保存せず、POST時だけ`SAML/SAML`を生成します。
+
+### GPOで事前配布する設定
+
+Tauri版の配布前にGPOで設定を管理する場合は、主に次の4項目を設定します。
+
+| 値名            | 種類        | 設定内容                                      |
+| --------------- | ----------- | --------------------------------------------- |
+| `CwfAddress`    | `REG_SZ`    | 実際のCreate!WebフローのポートレットURL       |
+| `AdServer`      | `REG_SZ`    | 通常認証で使用するAD Server。SAMLでは省略可能 |
+| `Id`            | `REG_SZ`    | SAML端末では`SAML`。通常認証では省略可能      |
+| `SchemaVersion` | `REG_DWORD` | `1`                                           |
+
+旧設定がない通常認証端末で`Id`を省略した場合は設定画面が開き、利用者がIDとPWを
+入力します。旧設定が残っている場合は、GPOの有効な`CwfAddress`を維持しながら
+旧ID、AD Server、PWなどを一度だけ移行します。SAML環境でも旧ID/PWのPOSTから
+IdPへ遷移できることを前提に、旧ID/PWを移行して利用できます。
+
+## 旧Electron版からの移行
+
+未移行の旧設定が存在する場合、Rust版の通常設定の有無にかかわらず一度だけ読み込みます。
+
+```text
+%APPDATA%\createwebflowchecker\config.json
+```
+
+- ID、AD Server、確認間隔、通知設定、ショートカットをレジストリへ移行
+- Rust版に有効なCWFAddressが既にあれば維持し、なければ旧CWFAddressを移行
+- Electron `safeStorage`で暗号化された`encpw`をWindows DPAPIで復号
+- `encpw`がなければ、旧旧keytar資格情報`cwfchecker/<ID>`を移行元として使用
+- PWをWindows資格情報マネージャーの`KashiharaCity.CwfChecker`へ保存
+- 書き込み後に通常設定と資格情報を読み返して確認
+- `LegacyMigrationVersion=1`を最後に保存し、認証前に再起動しても再移行しない
+
+移行直後には旧ファイルを削除しません。Create!Webフローのページで認証成功を確認した後、
+旧`config.json`と旧旧keytar資格情報を削除します。
 
 ## フッター画像
 
@@ -147,23 +184,6 @@ XFV20/manual/user/_images/cwfchecker_footer05.png
 
 存在する画像から1枚をランダムに選び、ポートレット画面下部へ表示します。
 画像は大小にかかわらずウィンドウ幅へ合わせ、縦横比を維持します。
-
-## 旧Electron版からの移行
-
-Rust版の通常設定がまだ存在しない場合、次の旧設定を読み込みます。
-
-```text
-%APPDATA%\createwebflowchecker\config.json
-```
-
-- ID、AD Server、CWFAddress、確認間隔、通知設定、ショートカットをレジストリへ移行
-- Electron `safeStorage`で暗号化された`encpw`をWindows DPAPIで復号
-- 旧旧keytar資格情報`cwfchecker/<ID>`があれば移行元として使用
-- PWをWindows資格情報マネージャーの`KashiharaCity.CwfChecker`へ保存
-- 書き込み後に通常設定と資格情報を読み返して確認
-
-移行直後には旧ファイルを削除しません。Create!Webフローのページで認証成功を確認した後、
-旧`config.json`と旧旧keytar資格情報を削除します。
 
 ## 一時データとダウンロード
 
