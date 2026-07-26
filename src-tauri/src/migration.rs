@@ -12,6 +12,11 @@ use std::{env, fs, io, path::PathBuf};
 
 const MAX_LEGACY_CONFIG_SIZE: u64 = 1024 * 1024;
 
+pub struct LoadedSettings {
+    pub settings: Settings,
+    pub persisted: bool,
+}
+
 /// Electron版のconfig.jsonで使用されていたフィールド名。
 ///
 /// バージョンによって値が欠けても読み込めるよう、各項目にdefaultを指定する。
@@ -53,17 +58,36 @@ fn interval(value: &serde_json::Value) -> u32 {
 }
 
 /// 現行設定を読み、存在しなければ旧Electron版から移行する。
-pub fn load_or_migrate() -> io::Result<Settings> {
-    if let Some(existing) = registry_support::report_io(
+pub fn load_or_migrate() -> io::Result<LoadedSettings> {
+    let existing = registry_support::report_io(
         "アプリ設定の読み込み",
         registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
         settings::read(),
-    )? {
-        return Ok(existing);
+    );
+    match existing {
+        Ok(Some(settings)) => {
+            return Ok(LoadedSettings {
+                settings,
+                persisted: true,
+            });
+        }
+        Ok(None) => {}
+        // 現行キーが存在するのに内容が不正な場合は旧版を再移行せず、
+        // 安全な初期値から設定画面で修復してもらう。
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            return Ok(LoadedSettings {
+                settings: Settings::default(),
+                persisted: false,
+            });
+        }
+        Err(error) => return Err(error),
     }
 
     let Some(path) = legacy_config_path().filter(|path| path.is_file()) else {
-        return Ok(Settings::default());
+        return Ok(LoadedSettings {
+            settings: Settings::default(),
+            persisted: false,
+        });
     };
     if fs::metadata(&path)?.len() > MAX_LEGACY_CONFIG_SIZE {
         return Err(io::Error::new(
@@ -141,17 +165,35 @@ pub fn load_or_migrate() -> io::Result<Settings> {
         )
     })();
     if let Err(error) = registry_result {
+        let registry_rollback = settings::restore(None);
         if wrote_credential {
-            credentials::restore(current.as_ref()).map_err(|rollback_error| {
-                io::Error::other(format!(
+            let credential_rollback = credentials::restore(current.as_ref());
+            if let (Err(registry_error), Err(credential_error)) =
+                (&registry_rollback, &credential_rollback)
+            {
+                return Err(io::Error::other(format!(
+                    "{error} レジストリを移行前の状態へ戻せませんでした: {registry_error} \
+                     Windows資格情報を移行前の状態へ戻せませんでした: {credential_error}"
+                )));
+            }
+            if let Err(rollback_error) = credential_rollback {
+                return Err(io::Error::other(format!(
                     "{error} Windows資格情報を移行前の状態へ戻せませんでした: {rollback_error}"
-                ))
-            })?;
+                )));
+            }
+        }
+        if let Err(rollback_error) = registry_rollback {
+            return Err(io::Error::other(format!(
+                "{error} レジストリを移行前の状態へ戻せませんでした: {rollback_error}"
+            )));
         }
         return Err(error);
     }
 
     // 読み返しで分かるのは保存データの一致まで。旧JSONと旧資格情報は、
     // Create!Webフロー側で認証成功を確認するまで残す。
-    Ok(settings)
+    Ok(LoadedSettings {
+        settings,
+        persisted: true,
+    })
 }

@@ -25,3 +25,6 @@ Thumbs.db
 *.ilk
 *.lib
 *.pdb
+
+# コードレビューのローカルメモ
+/review.md

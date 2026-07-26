@@ -45,21 +45,13 @@ fn win_error() -> io::Error {
     io::Error::last_os_error()
 }
 
-/// keytarのUTF-8を優先し、必要な場合だけ旧ツールのUTF-16LEとして読む。
-fn decode_password_blob(bytes: &[u8]) -> String {
-    String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| {
-        if bytes.len().is_multiple_of(2) {
-            // u8バッファーを直接u16ポインターへ変換すると、アドレスが
-            // 2バイト境界に揃っていない場合に未定義動作となる。2バイトずつ
-            // 明示的に読み、UTF-16LEへ安全に組み立てる。
-            let words: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .collect();
-            String::from_utf16_lossy(&words)
-        } else {
-            String::from_utf8_lossy(bytes).into_owned()
-        }
+/// 現行Rust版と旧keytar版が保存したUTF-8のCredentialBlobだけを受け入れる。
+fn decode_password_blob(bytes: &[u8]) -> io::Result<String> {
+    String::from_utf8(bytes.to_vec()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Windows資格情報のPWがUTF-8ではありません: {error}"),
+        )
     })
 }
 
@@ -117,7 +109,10 @@ pub fn read(target: &str) -> io::Result<Option<Credential>> {
         };
         let password = decode_password_blob(bytes);
         CredFree(pointer.cast::<c_void>());
-        Credential { username, password }
+        Credential {
+            username,
+            password: password?,
+        }
     };
     Ok(Some(result))
 }
@@ -266,12 +261,12 @@ mod tests {
     use super::{decode_password_blob, wide_null};
 
     #[test]
-    fn decodes_utf8_and_utf16le_without_pointer_casts() {
-        assert_eq!(decode_password_blob(b"password"), "password");
-
-        // 先頭に1バイト置いたスライスでも、未整列u16ポインターを作らず読める。
-        let unaligned = [0, 0xff, 0xfe];
-        assert_eq!(decode_password_blob(&unaligned[1..]), "\u{feff}");
+    fn accepts_only_utf8_password_blobs() {
+        assert_eq!(
+            decode_password_blob("pässword".as_bytes()).expect("UTF-8"),
+            "pässword"
+        );
+        assert!(decode_password_blob(&[0xff, 0xfe]).is_err());
     }
 
     #[test]

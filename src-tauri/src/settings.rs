@@ -114,7 +114,9 @@ pub fn read() -> io::Result<Option<Settings>> {
         shortcut: key
             .get_value("Shortcut")
             .unwrap_or_else(|_| "F3".to_owned()),
-    };
+    }
+    .normalize()
+    .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
     Ok(Some(settings))
 }
 
@@ -151,6 +153,26 @@ pub fn verify(expected: &Settings) -> io::Result<bool> {
     Ok(read()?.as_ref() == Some(expected))
 }
 
+/// 設定保存失敗時に、以前の完成済み設定または「設定なし」の状態へ戻す。
+pub fn restore(previous: Option<&Settings>) -> io::Result<()> {
+    if let Some(previous) = previous {
+        write(previous)?;
+        if verify(previous)? {
+            return Ok(());
+        }
+        return Err(io::Error::other(
+            "変更前のアプリ設定と復元後の設定が一致しません。",
+        ));
+    }
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    match hkcu.delete_subkey_all(REGISTRY_PATH) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Settings;
@@ -185,5 +207,23 @@ mod tests {
 
         let error = settings.normalize().unwrap_err();
         assert!(error.contains("ユーザー名やパスワード"));
+    }
+
+    #[test]
+    fn normalizes_values_loaded_from_storage() {
+        let settings = Settings {
+            id: "  USER  ".to_owned(),
+            cwf_address: "  https://workflow.example/XFV20/  ".to_owned(),
+            interval_minutes: 0,
+            shortcut: "  F3  ".to_owned(),
+            ..Settings::default()
+        }
+        .normalize()
+        .expect("normalized settings");
+
+        assert_eq!(settings.id, "USER");
+        assert_eq!(settings.cwf_address, "https://workflow.example/XFV20/");
+        assert_eq!(settings.interval_minutes, 15);
+        assert_eq!(settings.shortcut, "F3");
     }
 }

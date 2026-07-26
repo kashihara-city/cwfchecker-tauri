@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
     },
     thread,
     time::Duration,
@@ -35,6 +35,8 @@ const SETTINGS_LABEL: &str = "settings";
 const APP_TITLE: &str = "CreateWebFlowChecker";
 const NOTIFICATION_TITLE: &str = "電子決裁確認アプリ";
 const PORTLET_BOOTSTRAP_URL: &str = "http://tauri.localhost/portlet-bootstrap.html";
+const PORTLET_POST_SCRIPT: &str = include_str!("../scripts/portlet-post.js");
+const WEBVIEW_SCRIPT: &str = include_str!("../scripts/cwf-scan.js");
 /// ダウンロード直後にShellExecuteで開くと危険な、実行・スクリプト系の拡張子。
 const BLOCKED_DOWNLOAD_EXTENSIONS: &[&str] = &[
     "bat", "cmd", "com", "cpl", "dll", "exe", "hta", "jar", "jse", "js", "lnk", "msi", "msp",
@@ -56,16 +58,34 @@ fn show_windows_notification(app: &AppHandle, title: &str, body: &str) -> Result
 /// `RwLock`は設定の読み書きを、`Atomic*`は単純なフラグや件数を安全に共有する。
 pub struct AppState {
     settings: RwLock<Settings>,
+    settings_persisted: AtomicBool,
     cache_root: PathBuf,
     download_dir: PathBuf,
     quitting: AtomicBool,
     settings_opening: AtomicBool,
-    /// Rustが開始したローカルPOST画面への遷移だけを一度許可する。
-    post_navigation_armed: AtomicBool,
+    /// 複数スレッドからのnavigate要求順と世代番号の更新順を一致させる。
+    portlet_navigation: Mutex<()>,
+    /// 非同期のページ読込みが前後しても、最新の要求だけがPOSTを投入する。
+    portlet_load: Mutex<PortletLoadState>,
     /// SAML利用時に限り、認証完了までIdPへのHTTPSリダイレクトを許可する。
     authentication_in_progress: AtomicBool,
     decisions: AtomicUsize,
     decision_counter: AtomicUsize,
+}
+
+struct PortletLoadState {
+    active_generation: usize,
+    posted_generation: Option<usize>,
+}
+
+impl PortletLoadState {
+    fn claim_post(&mut self, generation: usize) -> bool {
+        if self.active_generation != generation || self.posted_generation == Some(generation) {
+            return false;
+        }
+        self.posted_generation = Some(generation);
+        true
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -159,12 +179,33 @@ fn is_portlet_bootstrap_url(url: &Url) -> bool {
         && url.path() == "/portlet-bootstrap.html"
 }
 
+fn portlet_bootstrap_url(generation: usize) -> Result<Url, String> {
+    let mut url = Url::parse(PORTLET_BOOTSTRAP_URL)
+        .map_err(|_| "POST開始ページのURLが不正です。".to_owned())?;
+    url.query_pairs_mut()
+        .append_pair("load", &generation.to_string());
+    Ok(url)
+}
+
+fn portlet_load_generation(url: &Url) -> Option<usize> {
+    if !is_portlet_bootstrap_url(url) {
+        return None;
+    }
+    // WebView生成時の初回ページだけはクエリなしで、世代1として扱う。
+    if url.query().is_none() {
+        return Some(1);
+    }
+    url.query_pairs()
+        .find(|(name, _)| name == "load")
+        .and_then(|(_, value)| value.parse().ok())
+}
+
 /// ローカルページ上で一度だけ実行する、公式例と同じhiddenフォームPOSTを作る。
 ///
 /// IDとPWはURLへ連結せず、`application/x-www-form-urlencoded`のPOST本文として
 /// WebView2から送信する。JSON文字列化により、引用符などをJavaScriptとして
 /// 解釈させない。
-fn portlet_post_script(state: &AppState) -> Result<String, String> {
+fn portlet_post_script(state: &AppState, bootstrap_url: &str) -> Result<String, String> {
     let settings = settings_snapshot(state)?;
     let credential = credentials::read(credentials::TARGET)
         .map_err(|error| error.to_string())?
@@ -173,157 +214,51 @@ fn portlet_post_script(state: &AppState) -> Result<String, String> {
         return Err("設定中のIDと保存済みPWのIDが一致しません。".to_owned());
     }
 
-    let action = serde_json::to_string(build_portlet_endpoint(&settings)?.as_str())
-        .map_err(|error| error.to_string())?;
-    let fields = serde_json::to_string(&[
-        ("view", "recv"),
-        ("loginid", settings.id.as_str()),
-        ("pwd", credential.password.as_str()),
-        ("ldapsvr", settings.ad_server.as_str()),
-    ])
-    .map_err(|error| error.to_string())?;
-
-    Ok(format!(
-        r#"
-(() => {{
-  if (window.location.href !== {bootstrap}) return;
-  const form = document.createElement("form");
-  form.method = "post";
-  form.action = {action};
-  form.referrerPolicy = "no-referrer";
-  for (const [name, value] of {fields}) {{
-    const input = document.createElement("input");
-    input.type = "hidden";
-    input.name = name;
-    input.value = value;
-    form.appendChild(input);
-  }}
-  document.body.appendChild(form);
-  form.submit();
-}})();
-"#,
-        bootstrap =
-            serde_json::to_string(PORTLET_BOOTSTRAP_URL).map_err(|error| error.to_string())?
-    ))
+    let config = serde_json::json!({
+        "bootstrapUrl": bootstrap_url,
+        "action": build_portlet_endpoint(&settings)?.as_str(),
+        "fields": [
+            ["view", "recv"],
+            ["loginid", settings.id.as_str()],
+            ["pwd", credential.password.as_str()],
+            ["ldapsvr", settings.ad_server.as_str()],
+        ],
+    });
+    Ok(format!("({PORTLET_POST_SCRIPT})({config});"))
 }
 
 /// POST開始ページへ遷移する直前だけ許可フラグを立てる。
 fn begin_portlet_load(window: &WebviewWindow, state: &AppState) -> Result<(), String> {
-    let bootstrap = Url::parse(PORTLET_BOOTSTRAP_URL)
-        .map_err(|_| "POST開始ページのURLが不正です。".to_owned())?;
-    state.post_navigation_armed.store(true, Ordering::Release);
+    let _navigation = state.portlet_navigation.lock().map_err(|_| lock_error())?;
+    let (previous_generation, generation) = {
+        let mut load = state.portlet_load.lock().map_err(|_| lock_error())?;
+        let previous = load.active_generation;
+        let generation = previous.wrapping_add(1).max(2);
+        load.active_generation = generation;
+        (previous, generation)
+    };
+    let bootstrap = portlet_bootstrap_url(generation)?;
+    let authentication_was_in_progress = state.authentication_in_progress.load(Ordering::Acquire);
     state
         .authentication_in_progress
         .store(true, Ordering::Release);
     if let Err(error) = window.navigate(bootstrap) {
-        state.post_navigation_armed.store(false, Ordering::Release);
+        if let Ok(mut load) = state.portlet_load.lock() {
+            if load.active_generation == generation {
+                load.active_generation = previous_generation;
+            }
+        }
         state
             .authentication_in_progress
-            .store(false, Ordering::Release);
+            .store(authentication_was_in_progress, Ordering::Release);
         return Err(error.to_string());
     }
     Ok(())
 }
 
 fn webview_script(origin: &str) -> String {
-    // JSON文字列化してから埋め込むことで、URL内の引用符などをJavaScriptとして
-    // 解釈させない。スクリプト側でもtop-levelかつ同一オリジンのページだけを扱う。
     let origin = serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".to_owned());
-    format!(
-        r#"
-(() => {{
-  const allowedOrigin = {origin};
-  // iframeや想定外サーバーでは、ページ内容の読取りやRust側への報告を行わない。
-  if (window.top !== window || window.location.origin !== allowedOrigin) return;
-  const imageCandidates = [
-    "cwfchecker_footer01.jpg", "cwfchecker_footer02.jpg",
-    "cwfchecker_footer03.jpg", "cwfchecker_footer04.jpg",
-    "cwfchecker_footer05.jpg", "cwfchecker_footer01.png",
-    "cwfchecker_footer02.png", "cwfchecker_footer03.png",
-    "cwfchecker_footer04.png", "cwfchecker_footer05.png"
-  ];
-  const countMatches = (source, needle) =>
-    needle ? (source.match(new RegExp(needle, "g")) || []).length : 0;
-  const checkImage = (url) => new Promise((resolve) => {{
-    const image = new Image();
-    // ポートレットURLの認証クエリを画像リクエストのRefererへ載せない。
-    image.referrerPolicy = "no-referrer";
-    image.onload = image.onerror = () => resolve(image.naturalWidth > 0 ? url : null);
-    image.src = url;
-  }});
-  window.__cwfScan = async () => {{
-    // DOMContentLoadedとTauriのページ読込み完了が続けて発火しても、
-    // 同じドキュメントの調査結果は一度だけRust側へ報告する。
-    if (!document.body || window.__cwfScanRunning || window.__cwfScanReported) return;
-    window.__cwfScanRunning = true;
-    try {{
-      // 旧Electron版と同じ目印を数え、処理待ち件数と認証成功を判定する。
-      const html = document.body.innerHTML;
-      const decisionCount = countMatches(html, "anchor anchor-primary");
-      const authCount = countMatches(html, "<!-- 認証成功 -->");
-      const countText = document.querySelector("ul.form-list_h span.dummy")?.textContent?.trim() || "0";
-      const baseUrl = window.location.href.split("XFV20")[0];
-      const images = (await Promise.all(imageCandidates.map(
-        name => checkImage(`${{baseUrl}}XFV20/manual/user/_images/${{name}}`)
-      ))).filter(Boolean);
-      // 更新のたびにフッターが増えないよう、前回追加した要素を先に取り除く。
-      document.querySelectorAll(".cwfchecker-tauri-footer").forEach(node => node.remove());
-      let contentHeight = 0;
-      if (images.length > 0) {{
-        const footer = document.createElement("div");
-        footer.className = "footer cwfchecker-tauri-footer";
-        footer.style.width = "100%";
-        footer.style.maxWidth = "100%";
-        footer.style.boxSizing = "border-box";
-        footer.style.overflow = "hidden";
-        const image = document.createElement("img");
-        image.referrerPolicy = "no-referrer";
-        image.style.display = "block";
-        image.style.width = "100%";
-        image.style.maxWidth = "100%";
-        image.style.height = "auto";
-        image.style.objectFit = "contain";
-        image.src = images[Math.floor(Math.random() * images.length)];
-        footer.appendChild(image);
-        const contents = document.querySelector("div.contents");
-        if (contents) {{
-          contents.insertAdjacentElement("afterend", footer);
-          const root = document.documentElement;
-          const previousOverflowY = root.style.overflowY;
-          root.style.overflowY = "hidden";
-          try {{
-            try {{ await image.decode(); }} catch {{}}
-            // 画像のレイアウト確定を2フレーム待ってから、Rust側へ正確な高さを返す。
-            await new Promise(resolve => requestAnimationFrame(
-              () => requestAnimationFrame(resolve)
-            ));
-            contentHeight = Math.ceil(footer.getBoundingClientRect().bottom + window.scrollY);
-          }} finally {{
-            root.style.overflowY = previousOverflowY;
-          }}
-        }}
-      }}
-      const previousTitle = document.title;
-      // 外部ページにはTauri IPCを公開しないため、一時的なdocument.titleを
-      // 最小限の通信路として使う。Rust側でもウィンドウ名とoriginを再検証する。
-      // 報告直前に印を付け、直後に起きた二度目の走査による重複通知を防ぐ。
-      // ページ更新や再POSTではwindow自体が作り直されるため、次回は再び報告される。
-      window.__cwfScanReported = true;
-      document.title = `__CWFCHECKER_REPORT__|${{decisionCount}}|${{authCount}}|${{images.length}}|${{contentHeight}}|${{countText.replaceAll("|", "")}}`;
-      await new Promise(resolve => setTimeout(resolve, 0));
-      document.title = previousTitle;
-    }} finally {{
-      window.__cwfScanRunning = false;
-    }}
-  }};
-  if (document.readyState === "loading") {{
-    document.addEventListener("DOMContentLoaded", () => window.__cwfScan(), {{ once: true }});
-  }} else {{
-    window.__cwfScan();
-  }}
-}})();
-"#
-    )
+    format!("({WEBVIEW_SCRIPT})({origin});")
 }
 
 fn cache_root() -> PathBuf {
@@ -345,16 +280,32 @@ fn prepare_cache() -> std::io::Result<PathBuf> {
     Ok(current)
 }
 
-fn cleanup_directory(path: &Path) {
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
+fn cleanup_directory(path: &Path) -> std::io::Result<()> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
     };
-    for entry in entries.flatten() {
+    let mut first_error = None;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
         let candidate = entry.path();
-        if candidate.is_file() {
-            let _ = fs::remove_file(candidate);
+        let result = if candidate.is_dir() {
+            fs::remove_dir_all(candidate)
+        } else {
+            fs::remove_file(candidate)
+        };
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
         }
     }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Windowsの関連付けアプリでファイルまたはURLを開く。
@@ -530,12 +481,11 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
         if has_allowed_origin(url, &origin_for_main_navigation) {
             return true;
         }
-        if is_portlet_bootstrap_url(url)
-            && state_for_navigation
-                .post_navigation_armed
-                .load(Ordering::Acquire)
-        {
-            return true;
+        if let Some(generation) = portlet_load_generation(url) {
+            return state_for_navigation
+                .portlet_load
+                .lock()
+                .is_ok_and(|load| load.active_generation == generation);
         }
         // SAML認証中だけはIdPへのHTTPSリダイレクトを許可する。
         state_for_navigation
@@ -553,25 +503,38 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
         let Ok(current_url) = window.url() else {
             return;
         };
-        if is_portlet_bootstrap_url(&current_url) {
-            // Rustが開始した遷移につき一度だけ、PWをPOST本文へ載せる。
-            if state_for_page_load
-                .post_navigation_armed
-                .swap(false, Ordering::AcqRel)
-            {
-                match portlet_post_script(&state_for_page_load) {
+        if let Some(generation) = portlet_load_generation(&current_url) {
+            // 最新世代の遷移につき一度だけ、PWをPOST本文へ載せる。
+            let should_post = state_for_page_load
+                .portlet_load
+                .lock()
+                .is_ok_and(|mut load| load.claim_post(generation));
+            if should_post {
+                match portlet_post_script(&state_for_page_load, current_url.as_str()) {
                     Ok(script) => {
                         if let Err(error) = window.eval(&script) {
-                            state_for_page_load
-                                .authentication_in_progress
-                                .store(false, Ordering::Release);
+                            if state_for_page_load
+                                .portlet_load
+                                .lock()
+                                .is_ok_and(|load| load.active_generation == generation)
+                            {
+                                state_for_page_load
+                                    .authentication_in_progress
+                                    .store(false, Ordering::Release);
+                            }
                             eprintln!("ポートレットのPOST開始に失敗しました: {error}");
                         }
                     }
                     Err(error) => {
-                        state_for_page_load
-                            .authentication_in_progress
-                            .store(false, Ordering::Release);
+                        if state_for_page_load
+                            .portlet_load
+                            .lock()
+                            .is_ok_and(|load| load.active_generation == generation)
+                        {
+                            state_for_page_load
+                                .authentication_in_progress
+                                .store(false, Ordering::Release);
+                        }
                         eprintln!("ポートレットのPOST情報を作成できませんでした: {error}");
                     }
                 }
@@ -753,6 +716,8 @@ pub fn save_settings(
     if settings.id.is_empty() {
         return Err("IDを入力してください。".to_owned());
     }
+    let previous_settings = settings_snapshot(&state)?;
+    let previous_registry = state.settings_persisted.load(Ordering::Acquire);
 
     // 保存済みPWはWebViewへ返さず、空欄で送られた場合だけRust側で引き継ぐ。
     let existing = credentials::read(credentials::TARGET).map_err(|error| error.to_string())?;
@@ -798,14 +763,28 @@ pub fn save_settings(
         .map_err(|error| error.to_string())
     })();
     if let Err(error) = registry_result {
-        return match credentials::restore(existing.as_ref()) {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(format!(
-                "{error}\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
-            )),
-        };
+        // 片方の復元に失敗しても、もう片方の復元は必ず試す。
+        let registry_rollback = registry_support::report_io(
+            "アプリ設定の復元",
+            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+            settings::restore(previous_registry.then_some(&previous_settings)),
+        );
+        let credential_rollback = credentials::restore(existing.as_ref());
+        let mut message = error;
+        if let Err(rollback_error) = registry_rollback {
+            message.push_str(&format!(
+                "\nアプリ設定を変更前の状態へ戻せませんでした: {rollback_error}"
+            ));
+        }
+        if let Err(rollback_error) = credential_rollback {
+            message.push_str(&format!(
+                "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
+            ));
+        }
+        return Err(message);
     }
     *state.settings.write().map_err(|_| lock_error())? = settings;
+    state.settings_persisted.store(true, Ordering::Release);
 
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
@@ -913,15 +892,21 @@ fn process_page_report(
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let cache_root = prepare_cache()?;
     let download_dir = app.path().document_dir()?.join("cwf_downloads");
-    let settings = migration::load_or_migrate()?;
+    let loaded = migration::load_or_migrate()?;
+    let settings = loaded.settings;
     let state = Arc::new(AppState {
         settings: RwLock::new(settings),
+        settings_persisted: AtomicBool::new(loaded.persisted),
         cache_root,
         download_dir,
         quitting: AtomicBool::new(false),
         settings_opening: AtomicBool::new(false),
-        // 最初のローカル起動ページはRustがWebView生成時に指定している。
-        post_navigation_armed: AtomicBool::new(true),
+        portlet_navigation: Mutex::new(()),
+        // 最初のローカル起動ページは世代1としてWebView生成時に指定している。
+        portlet_load: Mutex::new(PortletLoadState {
+            active_generation: 1,
+            posted_generation: None,
+        }),
         authentication_in_progress: AtomicBool::new(true),
         decisions: AtomicUsize::new(0),
         decision_counter: AtomicUsize::new(1),
@@ -1018,7 +1003,9 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
             })
             .unwrap_or(0);
         if previous <= 1 {
-            cleanup_directory(&state.download_dir);
+            if let Err(error) = cleanup_directory(&state.download_dir) {
+                eprintln!("ダウンロードフォルダーを空にできませんでした: {error}");
+            }
             show_main(app);
         }
     }
@@ -1049,11 +1036,17 @@ pub fn handle_shortcut(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_portlet_endpoint, has_allowed_origin, is_blocked_download, is_portlet_bootstrap_url,
-        parse_report_title, webview_script, NOTIFICATION_TITLE,
+        build_portlet_endpoint, cleanup_directory, has_allowed_origin, is_blocked_download,
+        is_portlet_bootstrap_url, parse_report_title, portlet_bootstrap_url,
+        portlet_load_generation, webview_script, PortletLoadState, NOTIFICATION_TITLE,
+        PORTLET_POST_SCRIPT,
     };
     use crate::settings::Settings;
-    use std::path::Path;
+    use std::{
+        fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
     use url::Url;
 
     #[test]
@@ -1082,6 +1075,7 @@ mod tests {
 
         assert!(script.contains("window.__cwfScanRunning || window.__cwfScanReported"));
         assert!(script.contains("window.__cwfScanReported = true;"));
+        assert!(PORTLET_POST_SCRIPT.contains("form.submit()"));
     }
 
     #[test]
@@ -1139,5 +1133,56 @@ mod tests {
         assert!(!is_portlet_bootstrap_url(
             &Url::parse("https://workflow.example/portlet-bootstrap.html").expect("URL")
         ));
+    }
+
+    #[test]
+    fn identifies_each_portlet_load_generation() {
+        let url = portlet_bootstrap_url(42).expect("bootstrap URL");
+
+        assert_eq!(portlet_load_generation(&url), Some(42));
+        assert_eq!(
+            portlet_load_generation(
+                &Url::parse("http://tauri.localhost/portlet-bootstrap.html").expect("URL")
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            portlet_load_generation(
+                &Url::parse("http://tauri.localhost/portlet-bootstrap.html?load=old").expect("URL")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_latest_portlet_load_can_post_once() {
+        let mut load = PortletLoadState {
+            active_generation: 8,
+            posted_generation: Some(7),
+        };
+
+        assert!(!load.claim_post(7));
+        assert!(load.claim_post(8));
+        assert!(!load.claim_post(8));
+    }
+
+    #[test]
+    fn removes_nested_download_contents_but_keeps_the_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("cwfchecker-cleanup-{}-{nonce}", std::process::id()));
+        let nested = root.join("expanded").join("nested");
+        fs::create_dir_all(&nested).expect("create nested directory");
+        fs::write(root.join("attachment.pdf"), b"file").expect("write top-level file");
+        fs::write(nested.join("document.txt"), b"file").expect("write nested file");
+
+        cleanup_directory(&root).expect("clean directory");
+
+        assert!(root.is_dir());
+        assert_eq!(fs::read_dir(&root).expect("read root").count(), 0);
+        fs::remove_dir(root).expect("remove test root");
     }
 }
