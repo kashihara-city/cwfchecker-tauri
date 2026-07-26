@@ -103,6 +103,8 @@ pub fn read() -> io::Result<Option<Settings>> {
         return Ok(None);
     }
 
+    // 個別の値が欠けた場合は既定値で補う。キー全体が完成済みかどうかは
+    // 上のSchemaVersionで判定済みなので、古い版で項目が増えても読み込める。
     let interval_minutes = key.get_value::<u32, _>("IntervalMinutes").unwrap_or(15);
     let notify = key.get_value::<u32, _>("NotifyByBar").unwrap_or(0);
     let settings = Settings {
@@ -115,6 +117,8 @@ pub fn read() -> io::Result<Option<Settings>> {
             .get_value("Shortcut")
             .unwrap_or_else(|_| "F3".to_owned()),
     }
+    // レジストリはregedit等でも変更できるため、保存時だけでなく読込時にも
+    // 同じ正規化・検証を行い、メモリへ不正な設定を持ち込まない。
     .normalize()
     .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
     Ok(Some(settings))
@@ -156,6 +160,7 @@ pub fn verify(expected: &Settings) -> io::Result<bool> {
 /// 設定保存失敗時に、以前の完成済み設定または「設定なし」の状態へ戻す。
 pub fn restore(previous: Option<&Settings>) -> io::Result<()> {
     if let Some(previous) = previous {
+        // 単に書き戻すだけでなく、読み直した値まで一致して初めて復元成功とする。
         write(previous)?;
         if verify(previous)? {
             return Ok(());
@@ -166,6 +171,8 @@ pub fn restore(previous: Option<&Settings>) -> io::Result<()> {
     }
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    // `None`は変更前に完成済み設定がなかったことを表す。
+    // 保存途中の値を残すと次回移行の判断を乱すため、アプリ専用キーごと削除する。
     match hkcu.delete_subkey_all(REGISTRY_PATH) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

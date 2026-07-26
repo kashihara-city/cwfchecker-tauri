@@ -12,6 +12,10 @@ use std::{env, fs, io, path::PathBuf};
 
 const MAX_LEGACY_CONFIG_SIZE: u64 = 1024 * 1024;
 
+/// 起動時に採用する設定と、それがレジストリへ完成保存済みかをセットで返す。
+///
+/// `Settings::default()`は「初回起動」と「壊れた設定からの安全な退避」の両方で使うため、
+/// 値だけでは保存済みか判断できない。`persisted`がその違いを保持する。
 pub struct LoadedSettings {
     pub settings: Settings,
     pub persisted: bool,
@@ -55,6 +59,33 @@ fn interval(value: &serde_json::Value) -> u32 {
         .or_else(|| value.as_str()?.parse().ok())
         .unwrap_or(15)
         .max(15)
+}
+
+/// 元のエラーへ、失敗した補償処理の内容だけを付け足す。
+///
+/// 資格情報を書かなかった移行では、資格情報の復元自体が不要なので`None`を渡す。
+fn with_rollback_errors(
+    original: io::Error,
+    registry_rollback: io::Result<()>,
+    credential_rollback: Option<io::Result<()>>,
+) -> io::Error {
+    let mut failures = Vec::new();
+    if let Err(error) = registry_rollback {
+        failures.push(format!(
+            "レジストリを移行前の状態へ戻せませんでした: {error}"
+        ));
+    }
+    if let Some(Err(error)) = credential_rollback {
+        failures.push(format!(
+            "Windows資格情報を移行前の状態へ戻せませんでした: {error}"
+        ));
+    }
+    if failures.is_empty() {
+        // 復元に成功した場合は、アクセス拒否など元のErrorKindもそのまま返す。
+        original
+    } else {
+        io::Error::other(format!("{original} {}", failures.join(" ")))
+    }
 }
 
 /// 現行設定を読み、存在しなければ旧Electron版から移行する。
@@ -134,6 +165,7 @@ pub fn load_or_migrate() -> io::Result<LoadedSettings> {
         (None, None) => None,
     };
 
+    // 後のレジストリ移行が失敗した場合、ここで書いた時だけ資格情報を復元する。
     let wrote_credential = password.is_some();
     if let Some(password) = password {
         credentials::write(credentials::TARGET, &settings.id, &password)?;
@@ -165,29 +197,15 @@ pub fn load_or_migrate() -> io::Result<LoadedSettings> {
         )
     })();
     if let Err(error) = registry_result {
+        // 現行設定がなかった場合だけ移行へ来るので、レジストリ側はキーなしへ戻す。
+        // 2個の復元は先に両方実行し、一方の失敗で他方を試さない状態を避ける。
         let registry_rollback = settings::restore(None);
-        if wrote_credential {
-            let credential_rollback = credentials::restore(current.as_ref());
-            if let (Err(registry_error), Err(credential_error)) =
-                (&registry_rollback, &credential_rollback)
-            {
-                return Err(io::Error::other(format!(
-                    "{error} レジストリを移行前の状態へ戻せませんでした: {registry_error} \
-                     Windows資格情報を移行前の状態へ戻せませんでした: {credential_error}"
-                )));
-            }
-            if let Err(rollback_error) = credential_rollback {
-                return Err(io::Error::other(format!(
-                    "{error} Windows資格情報を移行前の状態へ戻せませんでした: {rollback_error}"
-                )));
-            }
-        }
-        if let Err(rollback_error) = registry_rollback {
-            return Err(io::Error::other(format!(
-                "{error} レジストリを移行前の状態へ戻せませんでした: {rollback_error}"
-            )));
-        }
-        return Err(error);
+        let credential_rollback = wrote_credential.then(|| credentials::restore(current.as_ref()));
+        return Err(with_rollback_errors(
+            error,
+            registry_rollback,
+            credential_rollback,
+        ));
     }
 
     // 読み返しで分かるのは保存データの一致まで。旧JSONと旧資格情報は、
@@ -196,4 +214,35 @@ pub fn load_or_migrate() -> io::Result<LoadedSettings> {
         settings,
         persisted: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_rollback_errors;
+    use std::io;
+
+    #[test]
+    fn keeps_the_original_error_when_rollbacks_succeed() {
+        let error = with_rollback_errors(
+            io::Error::new(io::ErrorKind::PermissionDenied, "original"),
+            Ok(()),
+            Some(Ok(())),
+        );
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "original");
+    }
+
+    #[test]
+    fn reports_every_failed_rollback() {
+        let error = with_rollback_errors(
+            io::Error::other("save failed"),
+            Err(io::Error::other("registry failed")),
+            Some(Err(io::Error::other("credential failed"))),
+        );
+        let message = error.to_string();
+
+        assert!(message.contains("registry failed"));
+        assert!(message.contains("credential failed"));
+    }
 }

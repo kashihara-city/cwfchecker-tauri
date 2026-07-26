@@ -239,3 +239,112 @@ XSS/資格情報漏洩を意識した対策が随所にあり、テストも重�
 - `cargo clippy --locked --all-targets -- -D warnings`：成功。
 - `cargo build --locked`：成功。
 - 切り出したJavaScript：構文確認成功。
+
+---
+
+## 再レビュー（2026-07-26、対策後）
+
+`98e0cb5`（コードレビュー指摘への対策を実装）と`0d0a628`（SAML外部遷移に時間制限を追加）を
+diffで確認し、`cargo test --locked`（22件成功）・`cargo clippy --locked --all-targets -- -D warnings`
+（警告なし）を実際に再実行して検証した。結論として、指摘1・2・3・4・5・7は妥当に解消されている。
+新規のバグは見つからなかった。
+
+### 1. SAML認証中のHTTPS遷移許可 → 解消
+
+`AuthenticationState`（`in_progress` + `external_deadline`）による設計を確認した。
+- 設定先オリジンへ最初にPOSTで到達した時点では`external_deadline`が`None`のため
+  `finish_if_returned`は何もせず、意図通り閉じない。
+- 最初の外部HTTPS遷移で`external_deadline = now + 30s`を1回だけセットし、以後は
+  期限を延長しない（`Some(deadline) => now <= deadline`）。
+- 設定先オリジンへ戻った時点（`external_deadline`が`Some`）で即座に`finish()`する。
+- `process_page_report`もページレポート受信時に無条件で`finish()`するため、
+  外部へ一度も出ない通常の非SAMLフローでも別経路で確実に閉じる。
+- ダウンロード開始時にも`webview.url()`が設定先オリジンと一致するかを再検証するよう
+  `configure_download`が拡張されており、30秒の許可ウィンドウ中に開いた外部ページから
+  添付ファイルを自動保存・自動起動させる経路も塞がれている。
+- `cargo test`で`allows_external_https_for_thirty_seconds_without_extending_the_deadline`
+  と`rejects_downloads_started_from_external_pages`が実際に成功することを確認した。
+
+副次的な所見（対応必須ではない）: SAML遷移が30秒を超えて完了しない場合、以降の外部遷移は
+黙って拒否されるだけでユーザーへの明示的なタイムアウト表示がない。実運用でIdPの遅延が
+起きた場合に「固まった」ように見える可能性があるため、余裕があればタイムアウト時に
+ステータス表示や再試行導線を検討すると親切。
+
+### 2. `begin_portlet_load`の競合 → 解消
+
+`portlet_navigation`（関数全体を直列化する排他ロック）と`portlet_load`
+（世代番号と投入済みフラグを保持する状態）の2つの`Mutex`で構成されている。
+`begin_portlet_load`が関数全体にわたって`portlet_navigation`を保持するため、
+複数スレッドからの呼び出しは完全に直列化され、世代番号の採番と`window.navigate`の
+呼び出し順が常に一致する。`on_navigation`・`on_page_load`の双方が「現在アクティブな
+世代と一致する場合のみ」を条件にしており、古い世代への遅延イベントは無害化される。
+ロック取得の順序も呼び出し箇所ごとに一貫しており、デッドロックの懸念はない。
+`only_the_latest_portlet_load_can_post_once`・`identifies_each_portlet_load_generation`
+のテストも狙い通りの境界を検証できている。
+
+### 3. `cleanup_directory`のサブディレクトリ → 解消
+
+`fs::remove_dir_all`によるサブフォルダーの再帰削除に変更され、個々の削除失敗を
+`first_error`として集約しつつ残りの削除を継続する実装になっている。README側にも
+「残したい添付ファイルは閉じる前に退避してほしい」という利用者向けの注意が追記された。
+`removes_nested_download_contents_but_keeps_the_root`のテストで実際にネストした
+ディレクトリが片付くことを確認した。
+
+### 4. `decode_password_blob`のUTF-16LEフォールバック → 解消（対策側の指摘の方が正確）
+
+対応内容が妥当なだけでなく、対策側の指摘通り自分の元の評価（「実運用のASCIIパスワードでは
+まず起こらない」）は誤りだった。旧`String::from_utf8`はNULバイトを含むUTF-16LEの
+ASCII文字列に対しても大抵成功してしまうため、UTF-16LEフォールバック分岐は実際には
+ほぼ到達不能でありながら「対応している」ように見せていた。UTF-8専用にして不正なバイト列を
+明示的に拒否する変更は、あいまいさを完全に排除する正しい修正である。
+
+### 5. `settings::read()`の未検証読み込み → 解消
+
+`read()`の戻り値に`.normalize()`を通し、失敗時は`io::ErrorKind::InvalidData`を返すように
+なった。`migration::load_or_migrate()`側もこれを見て「現行設定なし」と「現行設定が不正」を
+区別し、不正な場合は旧Electron版の再移行を走らせず安全な初期値へフォールバックする設計に
+改善されている。`normalizes_values_loaded_from_storage`のテストも要点を突いている。
+
+一点、優先度は低いが気になった点: `settings::read()`のエラーは`migration.rs`内で
+`registry_support::report_io(...)`を通してから判定されるため、レジストリの値が不正だった
+場合でも、まず「レジストリ操作に失敗しました」という汎用エラーのMessageBoxが表示された後に
+初期設定画面が開く。実際には「壊れていたので安全に初期化した」だけであり、汎用の
+レジストリ障害（アクセス拒否など）と同じ深刻な文言が出るのはユーザーを不必要に驚かせる。
+余裕があれば、`InvalidData`の場合だけ表示文言を「設定を初期化しました」寄りに分けると親切。
+
+なお、これとは別に、旧Electron版の`config.json`自体が壊れている場合
+（`migration.rs`内の`legacy.normalize()`失敗）は今回の修正の対象外で、従来通り
+`load_or_migrate()`がハードエラーを返し、アプリ起動そのものが失敗する。旧版からの
+移行という過渡的なケースに限られるため優先度は低いが、5と同じ考え方（「壊れていたら
+再設定を促す」）を旧設定の読み込み失敗にも広げると一貫性が増す。
+
+### 6. JS注入コードの分離 → 解消
+
+`src-tauri/scripts/cwf-scan.js`・`portlet-post.js`を`include_str!`で取り込み、
+`(SCRIPT)(config);`の形でIIFE的に呼び出す方式になっている。動的値は
+`serde_json::json!`＋`Display`実装によるJSON文字列化のみで埋め込まれており、
+以前の`format!`直書きと同じエスケープ安全性を保ったまま、静的ロジックを
+ふつうのJSファイルとして扱えるようにできている。ハンドラー内の実装ロジック自体は
+移動のみで変更されておらず、挙動の差分もない。
+
+なお対策側コメントの「パスワードをWebViewのJSへ渡さないという記述は不正確」という
+指摘は妥当。パスワードはPOST開始用のローカルページ（`portlet-bootstrap.html`、
+`tauri.localhost`という信頼された自オリジン）でのみ一時的にJSへ渡り、外部の
+CWFサーバーやIPC・ログには渡らない、というのが正確な表現。
+
+### 7. 設定保存の補償処理 → 解消
+
+`previous_settings`（保存試行前のメモリ上のスナップショット）と`settings_persisted`
+（それが実際にレジストリへ完成保存されていたか）を保存処理の最初に取得し、レジストリ側の
+保存または保存後検証が失敗した場合に`settings::restore`でレジストリを以前の状態
+（未設定なら該当キーごと削除）へ戻すよう拡張された。Windows資格情報のロールバックとは
+独立して両方を必ず試行し、両方失敗した場合は両方のエラーを利用者へ返す。
+`migration::load_or_migrate`側の失敗時ロールバックも同様に対称化されている。
+プロセスクラッシュをまたぐ完全なACID性を提供しない点は妥当な割り切りとして受け入れられる。
+
+### 総括
+
+いずれの対策も、指摘した具体的なシナリオに対して的確に効いている。特に1と2は
+状態設計（`AuthenticationState`・`PortletLoadState`）とロック方針が明確で、
+追加されたテストも境界条件を的確に押さえている。残る所見は上記の2つの
+UXメッセージ表現（5関連）のみで、いずれも低優先度。

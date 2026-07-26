@@ -56,15 +56,22 @@ fn show_windows_notification(app: &AppHandle, title: &str, body: &str) -> Result
 
 /// 複数のコールバックやタイマースレッドから共有するアプリの状態。
 ///
-/// `RwLock`は設定の読み書きを、`Atomic*`は単純なフラグや件数を安全に共有する。
+/// `RwLock`は設定の読み書きを、`Mutex`は複数の値をまとめて更新する処理を、
+/// `Atomic*`は単純なフラグや件数を、それぞれスレッド間で安全に共有する。
 pub struct AppState {
     settings: RwLock<Settings>,
+    /// `settings`が初期値だけでなく、レジストリへ完成保存済みかを表す。
+    /// 保存失敗時に「旧設定を書き戻す」か「途中生成キーを消す」かの判断に使う。
     settings_persisted: AtomicBool,
     cache_root: PathBuf,
     download_dir: PathBuf,
     quitting: AtomicBool,
     settings_opening: AtomicBool,
     /// 複数スレッドからのnavigate要求順と世代番号の更新順を一致させる。
+    ///
+    /// `window.navigate()`はコールバックを呼ぶ可能性があるため、コールバックも使う
+    /// `portlet_load`とは別のMutexにする。1個にすると同じスレッドで二重取得して
+    /// デッドロックする恐れがある。
     portlet_navigation: Mutex<()>,
     /// 非同期のページ読込みが前後しても、最新の要求だけがPOSTを投入する。
     portlet_load: Mutex<PortletLoadState>,
@@ -74,14 +81,41 @@ pub struct AppState {
     decision_counter: AtomicUsize,
 }
 
+/// どのポートレット再読込みが現在有効かを表す。
+///
+/// `navigate()`は非同期なので、古いページの完了通知が新しい要求より後に届くことがある。
+/// 単純なtrue/falseでは区別できないため、要求ごとに増える世代番号を使う。
 struct PortletLoadState {
     active_generation: usize,
     posted_generation: Option<usize>,
 }
 
 impl PortletLoadState {
+    /// 次の世代を有効にし、失敗時に戻せるよう「変更前・変更後」を返す。
+    fn begin_next_generation(&mut self) -> (usize, usize) {
+        let previous = self.active_generation;
+        // 0と1は使わず、初回WebViewを世代1、明示的な再読込みを世代2以降にする。
+        let current = previous.wrapping_add(1).max(2);
+        self.active_generation = current;
+        (previous, current)
+    }
+
+    fn is_active(&self, generation: usize) -> bool {
+        self.active_generation == generation
+    }
+
+    /// この世代がまだ最新の場合だけ、navigate失敗前の世代へ戻す。
+    fn restore_if_active(&mut self, generation: usize, previous: usize) {
+        if self.is_active(generation) {
+            self.active_generation = previous;
+        }
+    }
+
+    /// 最新世代のPOST実行権を一度だけ取得する。
+    ///
+    /// `true`を受け取った呼び出し元だけがPW入りフォームを作成してよい。
     fn claim_post(&mut self, generation: usize) -> bool {
-        if self.active_generation != generation || self.posted_generation == Some(generation) {
+        if !self.is_active(generation) || self.posted_generation == Some(generation) {
             return false;
         }
         self.posted_generation = Some(generation);
@@ -90,12 +124,16 @@ impl PortletLoadState {
 }
 
 #[derive(Clone, Copy)]
+/// SAML認証中に、設定先以外のHTTPSへ移動できる期限を管理する。
 struct AuthenticationState {
+    /// ポートレットPOSTから認証結果の受信までの間だけtrueになる。
     in_progress: bool,
+    /// 最初の外部HTTPS遷移時に設定する固定期限。遷移のたびには延長しない。
     external_deadline: Option<Instant>,
 }
 
 impl AuthenticationState {
+    /// 新しいポートレット読込みでは、前回の期限を必ず捨てて認証をやり直す。
     fn begin(&mut self) {
         self.in_progress = true;
         self.external_deadline = None;
@@ -107,6 +145,8 @@ impl AuthenticationState {
     }
 
     fn finish_if_returned(&mut self) {
+        // `None`は「まだIdPへ出る前」なので、最初のPOST先到達では閉じない。
+        // `Some`なら一度IdP等へ出た後なので、設定先へ戻った時点で閉じる。
         if self.external_deadline.is_some() {
             self.finish();
         }
@@ -119,6 +159,7 @@ impl AuthenticationState {
         match self.external_deadline {
             Some(deadline) => now <= deadline,
             None => {
+                // ここで一度だけ期限を決める。後続リダイレクトでは書き換えない。
                 self.external_deadline = Some(now + EXTERNAL_AUTH_WINDOW);
                 true
             }
@@ -163,7 +204,7 @@ pub struct PageReport {
 }
 
 fn lock_error() -> String {
-    "設定情報のロックに失敗しました。".to_owned()
+    "アプリの共有状態のロックに失敗しました。".to_owned()
 }
 
 fn settings_snapshot(state: &AppState) -> Result<Settings, String> {
@@ -220,11 +261,14 @@ fn is_portlet_bootstrap_url(url: &Url) -> bool {
 fn portlet_bootstrap_url(generation: usize) -> Result<Url, String> {
     let mut url = Url::parse(PORTLET_BOOTSTRAP_URL)
         .map_err(|_| "POST開始ページのURLが不正です。".to_owned())?;
+    // `?load=N`はサーバーへ送る値ではなく、遅れて届いたWebViewイベントを
+    // どの読込み要求のものかRust側で見分けるための印。
     url.query_pairs_mut()
         .append_pair("load", &generation.to_string());
     Ok(url)
 }
 
+/// bootstrap URLに付けた`load`クエリから世代番号を取り出す。
 fn portlet_load_generation(url: &Url) -> Option<usize> {
     if !is_portlet_bootstrap_url(url) {
         return None;
@@ -265,17 +309,16 @@ fn portlet_post_script(state: &AppState, bootstrap_url: &str) -> Result<String, 
     Ok(format!("({PORTLET_POST_SCRIPT})({config});"))
 }
 
-/// POST開始ページへ遷移する直前だけ許可フラグを立てる。
+/// 新しい世代を採番し、POST開始ページへの遷移を直列に開始する。
 fn begin_portlet_load(window: &WebviewWindow, state: &AppState) -> Result<(), String> {
+    // このガードは関数末尾まで保持し、別スレッドのnavigate呼出しが追い越さないようにする。
     let _navigation = state.portlet_navigation.lock().map_err(|_| lock_error())?;
     let (previous_generation, generation) = {
         let mut load = state.portlet_load.lock().map_err(|_| lock_error())?;
-        let previous = load.active_generation;
-        let generation = previous.wrapping_add(1).max(2);
-        load.active_generation = generation;
-        (previous, generation)
+        load.begin_next_generation()
     };
     let bootstrap = portlet_bootstrap_url(generation)?;
+    // navigate自体が失敗した場合は、呼出し前の認証状態も復元する。
     let previous_authentication = {
         let mut authentication = state.authentication.lock().map_err(|_| lock_error())?;
         let previous = *authentication;
@@ -284,9 +327,7 @@ fn begin_portlet_load(window: &WebviewWindow, state: &AppState) -> Result<(), St
     };
     if let Err(error) = window.navigate(bootstrap) {
         if let Ok(mut load) = state.portlet_load.lock() {
-            if load.active_generation == generation {
-                load.active_generation = previous_generation;
-            }
+            load.restore_if_active(generation, previous_generation);
         }
         if let Ok(mut authentication) = state.authentication.lock() {
             *authentication = previous_authentication;
@@ -296,7 +337,24 @@ fn begin_portlet_load(window: &WebviewWindow, state: &AppState) -> Result<(), St
     Ok(())
 }
 
+/// 指定世代がまだ最新なら、その読込みで始めた外部HTTPS許可を終了する。
+///
+/// 古い世代の失敗通知で新しい認証試行まで閉じないため、世代確認と終了をセットで行う。
+fn finish_authentication_if_active_load(state: &AppState, generation: usize) {
+    let is_active = state
+        .portlet_load
+        .lock()
+        .is_ok_and(|load| load.is_active(generation));
+    if is_active {
+        if let Ok(mut authentication) = state.authentication.lock() {
+            authentication.finish();
+        }
+    }
+}
+
 fn webview_script(origin: &str) -> String {
+    // 値を手作業で引用符へ入れずJSON化することで、URL中の記号をJSコードとして
+    // 解釈させない。静的な処理本体は別ファイルなので通常のJSとして編集できる。
     let origin = serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".to_owned());
     format!("({WEBVIEW_SCRIPT})({origin});")
 }
@@ -320,12 +378,14 @@ fn prepare_cache() -> std::io::Result<PathBuf> {
     Ok(current)
 }
 
+/// アプリ管理のダウンロードフォルダーを残し、中身だけをすべて削除する。
 fn cleanup_directory(path: &Path) -> std::io::Result<()> {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
+    // 1件が使用中でも他のファイルは消せるよう、最初のエラーだけ覚えて処理を続ける。
     let mut first_error = None;
     for entry in entries {
         let entry = match entry {
@@ -397,10 +457,12 @@ fn has_allowed_origin(url: &Url, allowed_origin: &str) -> bool {
     matches!(url.scheme(), "http" | "https") && url.origin().ascii_serialization() == allowed_origin
 }
 
+/// ダウンロードを開始したページ自体が、信頼する設定先かを確認する。
 fn can_download_from_page(url: &Url, allowed_origin: &str) -> bool {
     has_allowed_origin(url, allowed_origin)
 }
 
+/// 添付の保存先、危険拡張子、ダウンロード後の自動起動を各WebViewへ設定する。
 fn configure_download(
     builder: WebviewWindowBuilder<'_, tauri::Wry, impl Manager<tauri::Wry>>,
     download_dir: PathBuf,
@@ -409,13 +471,15 @@ fn configure_download(
     builder.on_download(move |webview, event| {
         match event {
             DownloadEvent::Requested { destination, .. } => {
-                // IdPや認証中に開いた外部ページからは、添付の自動保存・起動を許可しない。
+                // ダウンロードURLではなく「現在表示中のページ」を検査する。
+                // これによりIdPや認証中の外部ページからの自動保存・起動を防ぐ。
                 if !webview
                     .url()
                     .is_ok_and(|url| can_download_from_page(&url, &allowed_origin))
                 {
                     return false;
                 }
+                // フォルダーが消されていても、次の添付時に作り直す。
                 if fs::create_dir_all(&download_dir).is_err() {
                     return false;
                 }
@@ -506,6 +570,9 @@ fn request_open_settings(app: &AppHandle) {
 fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> Result<(), String> {
     let origin = endpoint.origin().ascii_serialization();
     let script = webview_script(&origin);
+    // 各`move`クロージャーは渡した値の所有権を持つため、同じ値を複数の
+    // コールバックで使う分だけcloneしておく。Arcは参照カウントを増やし、
+    // Stringは短いオリジン文字列を複製する。
     let origin_for_main_navigation = origin.clone();
     let origin_for_popup = origin.clone();
     let origin_for_main_download = origin.clone();
@@ -531,6 +598,7 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
     .initialization_script(script)
     .menu(menu)
     .on_navigation(move |url| {
+        // 1. 設定先は常に許可する。ただしIdPから戻った場合は外部許可を閉じる。
         if has_allowed_origin(url, &origin_for_main_navigation) {
             if let Ok(mut authentication) = state_for_navigation.authentication.lock() {
                 // 最初のPOST先では閉じず、IdP等へ一度出た後の帰還時だけ閉じる。
@@ -538,13 +606,14 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
             }
             return true;
         }
+        // 2. ローカルbootstrapは、Rustが現在開始した世代だけ許可する。
         if let Some(generation) = portlet_load_generation(url) {
             return state_for_navigation
                 .portlet_load
                 .lock()
-                .is_ok_and(|load| load.active_generation == generation);
+                .is_ok_and(|load| load.is_active(generation));
         }
-        // 最初の外部HTTPS遷移から30秒間だけSAML IdP等への遷移を許可する。
+        // 3. その他は、最初の外部HTTPS遷移から30秒間だけSAML IdP等を許可する。
         state_for_navigation
             .authentication
             .lock()
@@ -564,6 +633,8 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
         };
         if let Some(generation) = portlet_load_generation(&current_url) {
             // 最新世代の遷移につき一度だけ、PWをPOST本文へ載せる。
+            // MutexGuardを`should_post`の計算で手放してからevalするため、
+            // eval中のコールバックが同じMutexを取得してもデッドロックしない。
             let should_post = state_for_page_load
                 .portlet_load
                 .lock()
@@ -572,32 +643,12 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
                 match portlet_post_script(&state_for_page_load, current_url.as_str()) {
                     Ok(script) => {
                         if let Err(error) = window.eval(&script) {
-                            if state_for_page_load
-                                .portlet_load
-                                .lock()
-                                .is_ok_and(|load| load.active_generation == generation)
-                            {
-                                if let Ok(mut authentication) =
-                                    state_for_page_load.authentication.lock()
-                                {
-                                    authentication.finish();
-                                }
-                            }
+                            finish_authentication_if_active_load(&state_for_page_load, generation);
                             eprintln!("ポートレットのPOST開始に失敗しました: {error}");
                         }
                     }
                     Err(error) => {
-                        if state_for_page_load
-                            .portlet_load
-                            .lock()
-                            .is_ok_and(|load| load.active_generation == generation)
-                        {
-                            if let Ok(mut authentication) =
-                                state_for_page_load.authentication.lock()
-                            {
-                                authentication.finish();
-                            }
-                        }
+                        finish_authentication_if_active_load(&state_for_page_load, generation);
                         eprintln!("ポートレットのPOST情報を作成できませんでした: {error}");
                     }
                 }
@@ -784,6 +835,8 @@ pub fn save_settings(
     if settings.id.is_empty() {
         return Err("IDを入力してください。".to_owned());
     }
+    // レジストリ保存が途中で失敗したときに戻せるよう、変更前を先に保存する。
+    // `previous_registry=false`なら、変更前は「設定キーなし」だったことを表す。
     let previous_settings = settings_snapshot(&state)?;
     let previous_registry = state.settings_persisted.load(Ordering::Acquire);
 
@@ -802,6 +855,7 @@ pub fn save_settings(
     };
     credentials::write(credentials::TARGET, &settings.id, &password)
         .map_err(|error| error.to_string())?;
+    // Windows APIが成功を返しても、実際に同じ内容を読めることまで確認する。
     let verified = credentials::read(credentials::TARGET)
         .map_err(|error| error.to_string())?
         .is_some_and(|value| value.username == settings.id && value.password == password);
@@ -811,6 +865,7 @@ pub fn save_settings(
     }
 
     let registry_result = (|| -> Result<(), String> {
+        // 小さなクロージャーにすることで、途中の`?`をまとめて1個のResultとして扱う。
         registry_support::report_io(
             "アプリ設定の保存",
             registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
@@ -831,7 +886,8 @@ pub fn save_settings(
         .map_err(|error| error.to_string())
     })();
     if let Err(error) = registry_result {
-        // 片方の復元に失敗しても、もう片方の復元は必ず試す。
+        // 資格情報とレジストリは別の保存先なので、片方の復元に失敗しても
+        // もう片方の復元は必ず試す。これが完全なトランザクションの代わりになる。
         let registry_rollback = registry_support::report_io(
             "アプリ設定の復元",
             registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
@@ -851,6 +907,7 @@ pub fn save_settings(
         }
         return Err(message);
     }
+    // 両方の永続化に成功してから、実行中アプリが参照する値を切り替える。
     *state.settings.write().map_err(|_| lock_error())? = settings;
     state.settings_persisted.store(true, Ordering::Release);
 
@@ -962,6 +1019,7 @@ fn process_page_report(
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let cache_root = prepare_cache()?;
     let download_dir = app.path().document_dir()?.join("cwf_downloads");
+    // `persisted`も受け取り、初期値だけの状態とレジストリ保存済みを区別する。
     let loaded = migration::load_or_migrate()?;
     let settings = loaded.settings;
     let state = Arc::new(AppState {
@@ -977,6 +1035,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             active_generation: 1,
             posted_generation: None,
         }),
+        // WebView生成時の最初のPOSTでもSAMLへ進めるよう、認証試行中から始める。
         authentication: Mutex::new(AuthenticationState {
             in_progress: true,
             external_deadline: None,
@@ -1283,6 +1342,12 @@ mod tests {
         assert!(!load.claim_post(7));
         assert!(load.claim_post(8));
         assert!(!load.claim_post(8));
+
+        let (previous, current) = load.begin_next_generation();
+        assert_eq!((previous, current), (8, 9));
+        assert!(load.is_active(9));
+        load.restore_if_active(9, previous);
+        assert!(load.is_active(8));
     }
 
     #[test]

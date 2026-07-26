@@ -107,6 +107,8 @@ pub fn read(target: &str) -> io::Result<Option<Credential>> {
         } else {
             slice::from_raw_parts(item.CredentialBlob, blob_size)
         };
+        // UTF-8変換は失敗し得るが、先にResultとして保持して必ずCredFreeしてから`?`で返す。
+        // 先に`?`を書くと、エラー時にWindowsが確保したpointerを解放できない。
         let password = decode_password_blob(bytes);
         CredFree(pointer.cast::<c_void>());
         Credential {
@@ -175,6 +177,7 @@ pub fn delete(target: &str) -> io::Result<()> {
 
 /// 更新失敗時などに、資格情報を変更前の状態へ戻す。
 pub fn restore(previous: Option<&Credential>) -> io::Result<()> {
+    // 変更前に存在したなら上書きし、存在しなかったなら今回作った項目を削除する。
     match previous {
         Some(credential) => write(TARGET, &credential.username, &credential.password),
         None => delete(TARGET),
