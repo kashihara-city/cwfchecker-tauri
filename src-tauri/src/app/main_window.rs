@@ -18,10 +18,83 @@ use std::{
     time::Instant,
 };
 use tauri::{
-    webview::{NewWindowResponse, PageLoadEvent},
-    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
+    webview::{NewWindowFeatures, NewWindowResponse, PageLoadEvent},
+    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, Wry,
 };
 use url::Url;
+
+/// CWF内のリンクから開く案件ウィンドウを、世代を問わず同じ制限付きで作る。
+///
+/// 案件ウィンドウ内の`target="_blank"`や`window.open()`もこの関数へ戻すことで、
+/// 子孫ウィンドウにオリジン制限やダウンロード検査が付かない経路を作らない。
+fn handle_new_window(
+    app: &AppHandle,
+    state: Arc<AppState>,
+    origin: String,
+    url: Url,
+    features: NewWindowFeatures,
+) -> NewWindowResponse<Wry> {
+    if !has_allowed_origin(&url, &origin) {
+        // 外部リンクは資格情報を持つWebViewへ読み込まず、通常ブラウザへ分離する。
+        if matches!(url.scheme(), "http" | "https") {
+            let _ = open_external(url.as_str());
+        }
+        return NewWindowResponse::Deny;
+    }
+    if url.path().ends_with("/XFV20/login") {
+        let _ = open_external(url.as_str());
+        return NewWindowResponse::Deny;
+    }
+
+    let number = state.decision_counter.fetch_add(1, Ordering::Relaxed);
+    let label = format!("decision-{number}");
+    let menu = match build_window_menu(app, &label) {
+        Ok(menu) => menu,
+        Err(_) => return NewWindowResponse::Deny,
+    };
+    let decision_origin = origin.clone();
+    let decision_download_origin = origin.clone();
+    let app_for_popup = app.clone();
+    let state_for_popup = state.clone();
+    let origin_for_popup = origin;
+    let decision = WebviewWindowBuilder::new(
+        app,
+        label,
+        WebviewUrl::External("about:blank".parse().expect("valid URL")),
+    )
+    .title(APP_TITLE)
+    .window_features(features)
+    .data_directory(state.cache_root.clone())
+    .on_navigation(move |url| {
+        url.as_str() == "about:blank" || has_allowed_origin(url, &decision_origin)
+    })
+    .on_new_window(move |url, features| {
+        handle_new_window(
+            &app_for_popup,
+            state_for_popup.clone(),
+            origin_for_popup.clone(),
+            url,
+            features,
+        )
+    })
+    .menu(menu)
+    .on_menu_event(|window, event| {
+        handle_window_menu(window, event.id().as_ref());
+    });
+    let decision = configure_download(
+        decision,
+        state.download_dir.clone(),
+        decision_download_origin,
+    );
+    match decision.build() {
+        Ok(window) => {
+            state.decisions.fetch_add(1, Ordering::Relaxed);
+            let _ = window.maximize();
+            NewWindowResponse::Create { window }
+        }
+        Err(_) => NewWindowResponse::Deny,
+    }
+}
 
 /// Create!Webフローのポートレットを表示するメインWebViewを作る。
 pub(super) fn create_main_window(
@@ -74,7 +147,7 @@ pub(super) fn create_main_window(
                 .lock()
                 .is_ok_and(|load| load.allows_bootstrap(generation));
         }
-        // 3. その他は、最初の外部HTTPS遷移から30秒間だけSAML IdP等を許可する。
+        // 3. その他は、最初の外部HTTPS遷移から60秒間だけSAML IdP等を許可する。
         state_for_navigation
             .authentication
             .lock()
@@ -126,56 +199,13 @@ pub(super) fn create_main_window(
         }
     })
     .on_new_window(move |url, features| {
-        if !has_allowed_origin(&url, &origin_for_popup) {
-            // 外部リンクは資格情報を持つWebViewへ読み込まず、通常ブラウザへ分離する。
-            if matches!(url.scheme(), "http" | "https") {
-                let _ = open_external(url.as_str());
-            }
-            return NewWindowResponse::Deny;
-        }
-        if url.path().ends_with("/XFV20/login") {
-            let _ = open_external(url.as_str());
-            return NewWindowResponse::Deny;
-        }
-
-        let number = state_for_popup
-            .decision_counter
-            .fetch_add(1, Ordering::Relaxed);
-        let label = format!("decision-{number}");
-        let menu = match build_window_menu(&app_for_popup, &label) {
-            Ok(menu) => menu,
-            Err(_) => return NewWindowResponse::Deny,
-        };
-        let decision_origin = origin_for_popup.clone();
-        let decision_download_origin = origin_for_popup.clone();
-        let decision = WebviewWindowBuilder::new(
+        handle_new_window(
             &app_for_popup,
-            label,
-            WebviewUrl::External("about:blank".parse().expect("valid URL")),
+            state_for_popup.clone(),
+            origin_for_popup.clone(),
+            url,
+            features,
         )
-        .title(APP_TITLE)
-        .window_features(features)
-        .data_directory(state_for_popup.cache_root.clone())
-        .on_navigation(move |url| {
-            url.as_str() == "about:blank" || has_allowed_origin(url, &decision_origin)
-        })
-        .menu(menu)
-        .on_menu_event(|window, event| {
-            handle_window_menu(window, event.id().as_ref());
-        });
-        let decision = configure_download(
-            decision,
-            state_for_popup.download_dir.clone(),
-            decision_download_origin,
-        );
-        match decision.build() {
-            Ok(window) => {
-                state_for_popup.decisions.fetch_add(1, Ordering::Relaxed);
-                let _ = window.maximize();
-                NewWindowResponse::Create { window }
-            }
-            Err(_) => NewWindowResponse::Deny,
-        }
     });
     configure_download(builder, download_dir, origin_for_main_download)
         .build()

@@ -111,6 +111,18 @@ fn settings_snapshot(state: &AppState) -> Result<Settings, String> {
         .map_err(|_| lock_error())
 }
 
+/// `withGlobalTauri`はリモートのCWF画面にもIPCブリッジを公開する。
+///
+/// capabilityだけでなく、すべてのTauriコマンドでこの検査を行い、
+/// 同梱した設定画面以外からアプリ定義コマンドを呼べない状態を維持する。
+fn ensure_settings_window(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() == SETTINGS_LABEL {
+        Ok(())
+    } else {
+        Err("許可されていないウィンドウです。".to_owned())
+    }
+}
+
 /// 認証情報を含まないポートレットの送信先URLを作る。
 fn build_portlet_endpoint(settings: &Settings) -> Result<Url, String> {
     let mut url = Url::parse(&settings.cwf_address)
@@ -163,9 +175,7 @@ pub fn get_settings(
     window: WebviewWindow,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<SettingsView, String> {
-    if window.label() != SETTINGS_LABEL {
-        return Err("許可されていないウィンドウです。".to_owned());
-    }
+    ensure_settings_window(&window)?;
     let settings = settings_snapshot(&state)?;
     Ok(SettingsView {
         id: settings.id,
@@ -185,9 +195,7 @@ pub fn save_settings(
     state: tauri::State<'_, Arc<AppState>>,
     input: SettingsInput,
 ) -> Result<(), String> {
-    if window.label() != SETTINGS_LABEL {
-        return Err("許可されていないウィンドウです。".to_owned());
-    }
+    ensure_settings_window(&window)?;
     let settings = Settings {
         id: input.id,
         ad_server: input.ad_server,

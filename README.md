@@ -77,7 +77,7 @@ HKEY_CURRENT_USER\Software\KashiharaCity\CwfChecker
 | `Id`              | ID                                 | Create!WebフローのログインID                    | 必須                 |
 | `AdServer`        | AD Server                          | Active Directoryサーバー名                      | 環境に応じて指定     |
 | `CwfAddress`      | CWFAddress                         | ポートレット画面のURL                           | HTTPまたはHTTPS      |
-| `IntervalMinutes` | 確認間隔                           | 自動更新間隔（分）                              | 最低15分、初期値15分 |
+| `IntervalMinutes` | 確認間隔                           | 自動更新間隔（分）                              | 15～360分、初期値15分 |
 | `NotifyByBar`     | ポップアップせず通知バーでお知らせ | 案件発見時にメイン画面ではなくWindows通知を表示 | 初期値OFF            |
 | `Shortcut`        | ショートカットキー                 | 表示・非表示を切り替えるキー                    | 初期値`F3`           |
 | `SchemaVersion`   | ―                                  | 設定形式のバージョン                            | アプリが自動設定     |
@@ -202,6 +202,8 @@ WebView2の一時データは起動時に作り直します。
 案件画面でダウンロードしたファイルはWindowsの関連付けアプリで開き、
 案件画面をすべて閉じた際に、`cwf_downloads`内のファイルとサブフォルダーをすべて削除します。
 残したい添付ファイルや展開内容は、案件画面を閉じる前に別のフォルダーへ移してください。
+本アプリは、Create!Webフロー側で添付可能なファイル形式が制限されていることを前提とします。
+クライアント側の拡張子ブロックは追加防御であり、サーバー側の添付ポリシーを置き換えるものではありません。
 誤実行を防ぐため、exe、msi、bat、cmd、PowerShell、JavaScriptなどの
 実行・スクリプト形式はダウンロードと自動起動の対象外です。
 

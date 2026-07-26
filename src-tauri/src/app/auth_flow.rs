@@ -22,8 +22,8 @@ use tauri::{AppHandle, PhysicalPosition, PhysicalSize, WebviewWindow};
 use url::Url;
 
 const PORTLET_BOOTSTRAP_URL: &str = "http://tauri.localhost/portlet-bootstrap.html";
-const EXTERNAL_AUTH_WINDOW: Duration = Duration::from_secs(30);
-const AUTHENTICATION_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+const EXTERNAL_AUTH_WINDOW: Duration = Duration::from_secs(60);
+const AUTHENTICATION_ATTEMPT_WINDOW: Duration = Duration::from_secs(90);
 const RELOAD_FALLBACK_DELAY: Duration = Duration::from_secs(5);
 const LOAD_GENERATION_PREFIX: &str = "__CWFCHECKER_LOAD__";
 const LOAD_GENERATION_STORAGE_KEY: &str = "__cwfcheckerLoadGeneration";
@@ -191,7 +191,7 @@ impl AuthenticationState {
             Some(deadline) => now <= deadline,
             None => {
                 // ここで一度だけ期限を決める。開始からの絶対上限を越えないよう、
-                // 「外部へ出てから30秒」と「認証開始から60秒」の早い方を使う。
+                // 「外部へ出てから60秒」と「認証開始から90秒」の早い方を使う。
                 self.external_deadline = Some((now + EXTERNAL_AUTH_WINDOW).min(attempt_deadline));
                 true
             }
@@ -612,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_external_https_for_thirty_seconds_without_extending_the_deadline() {
+    fn allows_external_https_for_sixty_seconds_without_extending_the_deadline() {
         let start = Instant::now();
         let mut authentication = AuthenticationState::initial(start);
         let idp = Url::parse("https://idp.example/login").expect("IdP URL");

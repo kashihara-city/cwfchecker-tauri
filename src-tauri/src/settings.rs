@@ -13,16 +13,24 @@ use winreg::{
 pub const REGISTRY_PATH: &str = r"Software\KashiharaCity\CwfChecker";
 const SCHEMA_VERSION: u32 = 1;
 const LEGACY_MIGRATION_VERSION: u32 = 1;
+const VALUE_ID: &str = "Id";
+const VALUE_AD_SERVER: &str = "AdServer";
+const VALUE_CWF_ADDRESS: &str = "CwfAddress";
+const VALUE_INTERVAL_MINUTES: &str = "IntervalMinutes";
+const VALUE_NOTIFY_BY_BAR: &str = "NotifyByBar";
+const VALUE_SHORTCUT: &str = "Shortcut";
+const VALUE_SCHEMA_VERSION: &str = "SchemaVersion";
 const LEGACY_MIGRATION_VALUE: &str = "LegacyMigrationVersion";
 pub const SAML_ID: &str = "SAML";
+pub const MAX_INTERVAL_MINUTES: u32 = 360;
 const SETTINGS_VALUE_NAMES: [&str; 8] = [
-    "Id",
-    "AdServer",
-    "CwfAddress",
-    "IntervalMinutes",
-    "NotifyByBar",
-    "Shortcut",
-    "SchemaVersion",
+    VALUE_ID,
+    VALUE_AD_SERVER,
+    VALUE_CWF_ADDRESS,
+    VALUE_INTERVAL_MINUTES,
+    VALUE_NOTIFY_BY_BAR,
+    VALUE_SHORTCUT,
+    VALUE_SCHEMA_VERSION,
     LEGACY_MIGRATION_VALUE,
 ];
 
@@ -76,14 +84,18 @@ impl Settings {
     /// この関数を読み書きの境界で必ず通すことで、レジストリ、メモリ、
     /// 設定画面の間で異なる形式の値を持たないようにしている。
     pub fn normalize(mut self) -> Result<Self, String> {
+        if self.id.chars().any(char::is_control) {
+            return Err("IDには制御文字を含めないでください。".to_owned());
+        }
+        if self.ad_server.chars().any(char::is_control) {
+            return Err("AD Serverには制御文字を含めないでください。".to_owned());
+        }
         self.id = self.id.trim().to_owned();
         self.ad_server = self.ad_server.trim().to_owned();
         self.cwf_address = self.cwf_address.trim().to_owned();
         self.shortcut = self.shortcut.trim().to_owned();
 
-        if self.interval_minutes < 15 {
-            self.interval_minutes = 15;
-        }
+        self.interval_minutes = self.interval_minutes.clamp(15, MAX_INTERVAL_MINUTES);
         if self.shortcut.is_empty() {
             self.shortcut = "F3".to_owned();
         }
@@ -170,7 +182,7 @@ pub fn read() -> io::Result<Option<Settings>> {
     };
 
     // SchemaVersionがない場合は、書き込み途中で中断された設定として扱う。
-    let schema: u32 = match key.get_value("SchemaVersion") {
+    let schema: u32 = match key.get_value(VALUE_SCHEMA_VERSION) {
         Ok(value) => value,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -181,16 +193,18 @@ pub fn read() -> io::Result<Option<Settings>> {
 
     // 個別の値が欠けた場合は既定値で補う。キー全体が完成済みかどうかは
     // 上のSchemaVersionで判定済みなので、古い版で項目が増えても読み込める。
-    let interval_minutes = key.get_value::<u32, _>("IntervalMinutes").unwrap_or(15);
-    let notify = key.get_value::<u32, _>("NotifyByBar").unwrap_or(0);
+    let interval_minutes = key
+        .get_value::<u32, _>(VALUE_INTERVAL_MINUTES)
+        .unwrap_or(15);
+    let notify = key.get_value::<u32, _>(VALUE_NOTIFY_BY_BAR).unwrap_or(0);
     let settings = Settings {
-        id: key.get_value("Id").unwrap_or_default(),
-        ad_server: key.get_value("AdServer").unwrap_or_default(),
-        cwf_address: key.get_value("CwfAddress").unwrap_or_default(),
+        id: key.get_value(VALUE_ID).unwrap_or_default(),
+        ad_server: key.get_value(VALUE_AD_SERVER).unwrap_or_default(),
+        cwf_address: key.get_value(VALUE_CWF_ADDRESS).unwrap_or_default(),
         interval_minutes,
         notify_by_bar: notify != 0,
         shortcut: key
-            .get_value("Shortcut")
+            .get_value(VALUE_SHORTCUT)
             .unwrap_or_else(|_| "F3".to_owned()),
     }
     // レジストリはregedit等でも変更できるため、保存時だけでなく読込時にも
@@ -211,20 +225,20 @@ pub fn write(settings: &Settings) -> io::Result<()> {
 
     // 既存設定を更新する場合も、最初に完成マーカーを外す。
     // 途中のset_valueで失敗しても、次回起動時に半端な設定を採用しないためである。
-    if let Err(error) = key.delete_value("SchemaVersion") {
+    if let Err(error) = key.delete_value(VALUE_SCHEMA_VERSION) {
         if error.kind() != io::ErrorKind::NotFound {
             return Err(error);
         }
     }
-    key.set_value("Id", &settings.id)?;
-    key.set_value("AdServer", &settings.ad_server)?;
-    key.set_value("CwfAddress", &settings.cwf_address)?;
-    key.set_value("IntervalMinutes", &settings.interval_minutes)?;
-    key.set_value("NotifyByBar", &(settings.notify_by_bar as u32))?;
-    key.set_value("Shortcut", &settings.shortcut)?;
+    key.set_value(VALUE_ID, &settings.id)?;
+    key.set_value(VALUE_AD_SERVER, &settings.ad_server)?;
+    key.set_value(VALUE_CWF_ADDRESS, &settings.cwf_address)?;
+    key.set_value(VALUE_INTERVAL_MINUTES, &settings.interval_minutes)?;
+    key.set_value(VALUE_NOTIFY_BY_BAR, &(settings.notify_by_bar as u32))?;
+    key.set_value(VALUE_SHORTCUT, &settings.shortcut)?;
 
     // すべての値を書けた場合だけ、最後に完成マーカーを戻す。
-    key.set_value("SchemaVersion", &SCHEMA_VERSION)?;
+    key.set_value(VALUE_SCHEMA_VERSION, &SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -296,7 +310,10 @@ pub fn restore_snapshot(snapshot: &RegistrySnapshot) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{migration_version_completed, restore_snapshot_at, snapshot_at, Settings, SAML_ID};
+    use super::{
+        migration_version_completed, restore_snapshot_at, snapshot_at, Settings,
+        MAX_INTERVAL_MINUTES, SAML_ID,
+    };
     use std::time::SystemTime;
     use winreg::{
         enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE},
@@ -351,6 +368,44 @@ mod tests {
         assert_eq!(settings.cwf_address, "https://workflow.example/XFV20/");
         assert_eq!(settings.interval_minutes, 15);
         assert_eq!(settings.shortcut, "F3");
+    }
+
+    #[test]
+    fn clamps_interval_to_supported_range() {
+        let below_minimum = Settings {
+            interval_minutes: 1,
+            ..Settings::default()
+        }
+        .normalize()
+        .expect("minimum interval");
+        let above_maximum = Settings {
+            interval_minutes: u32::MAX,
+            ..Settings::default()
+        }
+        .normalize()
+        .expect("maximum interval");
+
+        assert_eq!(below_minimum.interval_minutes, 15);
+        assert_eq!(above_maximum.interval_minutes, MAX_INTERVAL_MINUTES);
+    }
+
+    #[test]
+    fn rejects_control_characters_in_identity_fields() {
+        let id_error = Settings {
+            id: "USER\u{0007}NAME".to_owned(),
+            ..Settings::default()
+        }
+        .normalize()
+        .unwrap_err();
+        let ad_server_error = Settings {
+            ad_server: "AD SERVER\r".to_owned(),
+            ..Settings::default()
+        }
+        .normalize()
+        .unwrap_err();
+
+        assert!(id_error.contains("ID"));
+        assert!(ad_server_error.contains("AD Server"));
     }
 
     #[test]

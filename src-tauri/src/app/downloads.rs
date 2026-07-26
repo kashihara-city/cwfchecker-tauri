@@ -10,6 +10,9 @@ use url::Url;
 use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 
 /// ダウンロード直後にShellExecuteで開くと危険な、実行・スクリプト系の拡張子。
+///
+/// CWF側の添付拡張子制限を信頼境界とし、このリストは追加防御として使う。
+/// サーバー側の添付ポリシーを変更する場合は、クライアント側の判定も再評価すること。
 const BLOCKED_DOWNLOAD_EXTENSIONS: &[&str] = &[
     "bat", "cmd", "com", "cpl", "dll", "exe", "hta", "jar", "jse", "js", "lnk", "msi", "msp",
     "ps1", "reg", "scr", "sys", "url", "vbe", "vbs", "wsf", "wsh",
