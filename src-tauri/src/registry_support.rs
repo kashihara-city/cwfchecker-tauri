@@ -62,6 +62,14 @@ pub fn show_startup_error(error: &impl Display) {
     show_error_message(&format!("アプリの起動に失敗しました。\n\n詳細: {error}"));
 }
 
+/// 有効な現行設定で起動を続けられる場合に、旧設定だけを採用できなかったと知らせる。
+pub fn show_migration_warning(error: &impl Display) {
+    show_error_message(&format!(
+        "旧Electron版の設定を移行できなかったため、現在の設定で起動します。\n\
+         旧設定ファイルは削除していません。\n\n詳細: {error}"
+    ));
+}
+
 pub fn report_io<T>(operation: &str, path: &str, result: io::Result<T>) -> io::Result<T> {
     result.inspect_err(|error| {
         show_registry_error(operation, path, error);

@@ -124,6 +124,8 @@ Windows資格情報マネージャーの汎用資格情報として保存しま�
 設定画面でPWを空欄にした場合は保存済みPWを維持します。
 IDを変更する場合はPWの再入力が必要です。
 IDを`SAML`にした場合は資格情報を保存せず、POST時だけ`SAML/SAML`を生成します。
+通常認証からSAMLへ切り替えた場合、既存の資格情報は障害時の切り戻し用として残しますが、
+SAML動作中には読み取りもPOSTも行いません。
 
 ### GPOで事前配布する設定
 
@@ -138,8 +140,9 @@ Tauri版の配布前にGPOで設定を管理する場合は、主に次の4項�
 
 旧設定がない通常認証端末で`Id`を省略した場合は設定画面が開き、利用者がIDとPWを
 入力します。旧設定が残っている場合は、GPOの有効な`CwfAddress`を維持しながら
-旧ID、AD Server、PWなどを一度だけ移行します。SAML環境でも旧ID/PWのPOSTから
-IdPへ遷移できることを前提に、旧ID/PWを移行して利用できます。
+旧ID、AD Server、PWなどを一度だけ移行します。旧設定側の項目が空または欠落していれば、
+対応するGPO配布値を維持します。SAML環境でも旧ID/PWのPOSTからIdPへ遷移できることを
+前提に、旧ID/PWを移行して利用できます。
 
 ## 旧Electron版からの移行
 
@@ -150,15 +153,18 @@ IdPへ遷移できることを前提に、旧ID/PWを移行して利用できま
 ```
 
 - ID、AD Server、確認間隔、通知設定、ショートカットをレジストリへ移行
+- 旧設定側で空または欠落している項目は、完成済みのRust版設定があれば維持
 - Rust版に有効なCWFAddressが既にあれば維持し、なければ旧CWFAddressを移行
-- Electron `safeStorage`で暗号化された`encpw`をWindows DPAPIで復号
-- `encpw`がなければ、旧旧keytar資格情報`cwfchecker/<ID>`を移行元として使用
+- 同じIDの現行資格情報があれば最優先で維持
+- 現行資格情報がなければElectron `safeStorage`の`encpw`、次に
+  旧旧keytar資格情報`cwfchecker/<ID>`の順でPWを移行
 - PWをWindows資格情報マネージャーの`KashiharaCity.CwfChecker`へ保存
 - 書き込み後に通常設定と資格情報を読み返して確認
 - `LegacyMigrationVersion=1`を最後に保存し、認証前に再起動しても再移行しない
 
 移行直後には旧ファイルを削除しません。Create!Webフローのページで認証成功を確認した後、
 旧`config.json`と旧旧keytar資格情報を削除します。
+旧設定が壊れていても有効なRust版設定があれば、警告を表示して現在の設定で起動を続けます。
 
 ## フッター画像
 

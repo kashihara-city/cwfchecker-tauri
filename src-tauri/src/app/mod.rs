@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize},
         Arc, Mutex, RwLock,
     },
     thread,
@@ -56,9 +56,6 @@ fn show_windows_notification(app: &AppHandle, title: &str, body: &str) -> Result
 /// `Atomic*`は単純なフラグや件数を、それぞれスレッド間で安全に共有する。
 pub struct AppState {
     settings: RwLock<Settings>,
-    /// `settings`が初期値だけでなく、レジストリへ完成保存済みかを表す。
-    /// 保存失敗時に「旧設定を書き戻す」か「途中生成キーを消す」かの判断に使う。
-    settings_persisted: AtomicBool,
     cache_root: PathBuf,
     download_dir: PathBuf,
     quitting: AtomicBool,
@@ -100,7 +97,6 @@ pub struct SettingsView {
     interval_minutes: u32,
     notify_by_bar: bool,
     shortcut: String,
-    has_password: bool,
 }
 
 fn lock_error() -> String {
@@ -171,13 +167,6 @@ pub fn get_settings(
         return Err("許可されていないウィンドウです。".to_owned());
     }
     let settings = settings_snapshot(&state)?;
-    let has_password = if settings.uses_saml() {
-        false
-    } else {
-        credentials::read(credentials::TARGET)
-            .map_err(|error| error.to_string())?
-            .is_some_and(|credential| credential.username == settings.id)
-    };
     Ok(SettingsView {
         id: settings.id,
         ad_server: settings.ad_server,
@@ -185,7 +174,6 @@ pub fn get_settings(
         interval_minutes: settings.interval_minutes,
         notify_by_bar: settings.notify_by_bar,
         shortcut: settings.shortcut,
-        has_password,
     })
 }
 
@@ -212,10 +200,13 @@ pub fn save_settings(
     if settings.id.is_empty() {
         return Err("IDを入力してください。".to_owned());
     }
-    // レジストリ保存が途中で失敗したときに戻せるよう、変更前を先に保存する。
-    // `previous_registry=false`なら、変更前は「設定キーなし」だったことを表す。
-    let previous_settings = settings_snapshot(&state)?;
-    let previous_registry = state.settings_persisted.load(Ordering::Acquire);
+    // レジストリ保存が途中で失敗したときに、GPO値も含む変更前の型と値へ戻す。
+    let registry_snapshot = registry_support::report_io(
+        "アプリ設定の変更前状態の読み込み",
+        registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+        settings::snapshot(),
+    )
+    .map_err(|error| error.to_string())?;
 
     // SAMLでは固定のPOST値を実行時に生成し、資格情報マネージャーへは保存しない。
     // 通常認証では保存済みPWをWebViewへ返さず、空欄ならRust側で引き継ぐ。
@@ -237,19 +228,17 @@ pub fn save_settings(
         } else {
             input.password
         };
-        credentials::write(credentials::TARGET, &settings.id, &password)
-            .map_err(|error| error.to_string())?;
-        // Windows APIが成功を返しても、実際に同じ内容を読めることまで確認する。
-        let verified = credentials::read(credentials::TARGET)
-            .map_err(|error| error.to_string())?
-            .is_some_and(|value| value.username == settings.id && value.password == password);
-        if !verified {
-            let _ = credentials::restore(existing.as_ref());
-            return Err("Windows資格情報の保存後検証に失敗しました。".to_owned());
+        if let Err(error) =
+            credentials::write_verified(credentials::TARGET, &settings.id, &password)
+        {
+            let mut message = error.to_string();
+            if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
+                message.push_str(&format!(
+                    "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
+                ));
+            }
+            return Err(message);
         }
-    } else {
-        // 入力欄に値が残っていても、予約IDの疑似PWとして永続化しない。
-        drop(input.password);
     }
 
     let registry_result = (|| -> Result<(), String> {
@@ -279,7 +268,7 @@ pub fn save_settings(
         let registry_rollback = registry_support::report_io(
             "アプリ設定の復元",
             registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            settings::restore(previous_registry.then_some(&previous_settings)),
+            settings::restore_snapshot(&registry_snapshot),
         );
         let credential_rollback = wrote_credential.then(|| credentials::restore(existing.as_ref()));
         let mut message = error;
@@ -297,7 +286,6 @@ pub fn save_settings(
     }
     // 両方の永続化に成功してから、実行中アプリが参照する値を切り替える。
     *state.settings.write().map_err(|_| lock_error())? = settings;
-    state.settings_persisted.store(true, Ordering::Release);
 
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
@@ -310,12 +298,10 @@ pub fn save_settings(
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let cache_root = prepare_cache()?;
     let download_dir = app.path().document_dir()?.join("cwf_downloads");
-    // `persisted`も受け取り、初期値だけの状態とレジストリ保存済みを区別する。
     let loaded = migration::load_or_migrate()?;
     let settings = loaded.settings;
     let state = Arc::new(AppState {
         settings: RwLock::new(settings),
-        settings_persisted: AtomicBool::new(loaded.persisted),
         cache_root,
         download_dir,
         quitting: AtomicBool::new(false),

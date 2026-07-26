@@ -159,6 +159,20 @@ pub fn write(target: &str, username: &str, password: &str) -> io::Result<()> {
     }
 }
 
+/// 書き込み成功だけでなく、同じ内容を直後に読み返せることまで確認する。
+pub fn write_verified(target: &str, username: &str, password: &str) -> io::Result<()> {
+    write(target, username, password)?;
+    let verified = read(target)?
+        .is_some_and(|actual| actual.username == username && actual.password == password);
+    if verified {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "Windows資格情報の書き込み後検証に失敗しました。",
+        ))
+    }
+}
+
 /// 指定ターゲットを削除する。最初から存在しない場合も成功として扱う。
 pub fn delete(target: &str) -> io::Result<()> {
     let target = wide_null(target)?;

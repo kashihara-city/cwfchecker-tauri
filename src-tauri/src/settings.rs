@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use winreg::{
     enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE},
-    RegKey,
+    RegKey, RegValue,
 };
 
 pub const REGISTRY_PATH: &str = r"Software\KashiharaCity\CwfChecker";
@@ -15,6 +15,28 @@ const SCHEMA_VERSION: u32 = 1;
 const LEGACY_MIGRATION_VERSION: u32 = 1;
 const LEGACY_MIGRATION_VALUE: &str = "LegacyMigrationVersion";
 pub const SAML_ID: &str = "SAML";
+const SETTINGS_VALUE_NAMES: [&str; 8] = [
+    "Id",
+    "AdServer",
+    "CwfAddress",
+    "IntervalMinutes",
+    "NotifyByBar",
+    "Shortcut",
+    "SchemaVersion",
+    LEGACY_MIGRATION_VALUE,
+];
+
+/// アプリが変更する各値の、書き込み前の型とバイト列。
+///
+/// キー全体を削除せず値単位で復元することで、GPOや将来追加された別の値を巻き込まない。
+#[derive(PartialEq)]
+pub struct RegistrySnapshot {
+    values: Vec<(&'static str, Option<RegValue>)>,
+}
+
+fn migration_version_completed(version: u32) -> bool {
+    version >= LEGACY_MIGRATION_VERSION
+}
 
 /// Rust内部と設定画面のJavaScriptで共有する、パスワード以外の設定。
 ///
@@ -104,8 +126,16 @@ pub fn legacy_migration_completed() -> io::Result<bool> {
         Err(error) => return Err(error),
     };
     match key.get_value::<u32, _>(LEGACY_MIGRATION_VALUE) {
-        Ok(version) => Ok(version == LEGACY_MIGRATION_VERSION),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        // 新しい版で移行済みなら、古い版へ戻しても再移行しない。
+        Ok(version) => Ok(migration_version_completed(version)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            Ok(false)
+        }
         Err(error) => Err(error),
     }
 }
@@ -203,32 +233,75 @@ pub fn verify(expected: &Settings) -> io::Result<bool> {
     Ok(read()?.as_ref() == Some(expected))
 }
 
-/// 設定保存失敗時に、以前の完成済み設定または「設定なし」の状態へ戻す。
-pub fn restore(previous: Option<&Settings>) -> io::Result<()> {
-    if let Some(previous) = previous {
-        // 単に書き戻すだけでなく、読み直した値まで一致して初めて復元成功とする。
-        write(previous)?;
-        if verify(previous)? {
-            return Ok(());
-        }
-        return Err(io::Error::other(
-            "変更前のアプリ設定と復元後の設定が一致しません。",
-        ));
-    }
-
+/// 書き込み前の各値を、型も含めて読み取る。キーなしは全項目`None`として保持する。
+fn snapshot_at(path: &str) -> io::Result<RegistrySnapshot> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    // `None`は変更前に完成済み設定がなかったことを表す。
-    // 保存途中の値を残すと次回移行の判断を乱すため、アプリ専用キーごと削除する。
-    match hkcu.delete_subkey_all(REGISTRY_PATH) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+    let key = match hkcu.open_subkey_with_flags(path, KEY_READ) {
+        Ok(key) => Some(key),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let mut values = Vec::with_capacity(SETTINGS_VALUE_NAMES.len());
+    for name in SETTINGS_VALUE_NAMES {
+        let value = match key.as_ref().map(|key| key.get_raw_value(name)) {
+            Some(Ok(value)) => Some(value),
+            Some(Err(error)) if error.kind() == io::ErrorKind::NotFound => None,
+            Some(Err(error)) => return Err(error),
+            None => None,
+        };
+        values.push((name, value));
     }
+    Ok(RegistrySnapshot { values })
+}
+
+pub fn snapshot() -> io::Result<RegistrySnapshot> {
+    snapshot_at(REGISTRY_PATH)
+}
+
+/// アプリが変更した値だけを書き込み前へ戻し、サブキー自体や未知の値は削除しない。
+fn restore_snapshot_at(path: &str, snapshot: &RegistrySnapshot) -> io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey_with_flags(path, KEY_READ | KEY_WRITE)?;
+    let mut first_error = None;
+    for (name, value) in &snapshot.values {
+        let result = match value {
+            Some(value) => key.set_raw_value(name, value),
+            None => match key.delete_value(name) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        };
+        if first_error.is_none() {
+            if let Err(error) = result {
+                first_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if &snapshot_at(path)? == snapshot {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "変更前のレジストリ値と復元後の値が一致しません。",
+        ))
+    }
+}
+
+pub fn restore_snapshot(snapshot: &RegistrySnapshot) -> io::Result<()> {
+    restore_snapshot_at(REGISTRY_PATH, snapshot)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Settings, SAML_ID};
+    use super::{migration_version_completed, restore_snapshot_at, snapshot_at, Settings, SAML_ID};
+    use std::time::SystemTime;
+    use winreg::{
+        enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE},
+        RegKey,
+    };
 
     #[test]
     fn accepts_shortcut_with_plus_separator() {
@@ -290,5 +363,54 @@ mod tests {
 
         settings.id = "saml".to_owned();
         assert!(!settings.uses_saml());
+    }
+
+    #[test]
+    fn treats_newer_migration_markers_as_completed() {
+        assert!(!migration_version_completed(0));
+        assert!(migration_version_completed(1));
+        assert!(migration_version_completed(2));
+    }
+
+    #[test]
+    fn restores_only_managed_registry_values_with_their_original_types() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let test_root = r"Software\KashiharaCity\CwfCheckerTests";
+        let path = format!(r"{test_root}\snapshot-{}-{nonce}", std::process::id());
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu
+            .create_subkey_with_flags(&path, KEY_READ | KEY_WRITE)
+            .expect("create test key");
+        key.set_value("Id", &"before").expect("set ID");
+        key.set_value("SchemaVersion", &1_u32).expect("set schema");
+        key.set_value("Unmanaged", &"keep")
+            .expect("set unmanaged value");
+        let snapshot = snapshot_at(&path).expect("snapshot");
+
+        key.set_value("Id", &"after").expect("change ID");
+        key.set_value("SchemaVersion", &"wrong type")
+            .expect("change schema type");
+        key.set_value("AdServer", &"temporary")
+            .expect("add managed value");
+        restore_snapshot_at(&path, &snapshot).expect("restore");
+
+        assert_eq!(key.get_value::<String, _>("Id").expect("read ID"), "before");
+        assert_eq!(
+            key.get_value::<u32, _>("SchemaVersion")
+                .expect("read schema"),
+            1
+        );
+        assert!(key.get_raw_value("AdServer").is_err());
+        assert_eq!(
+            key.get_value::<String, _>("Unmanaged")
+                .expect("read unmanaged value"),
+            "keep"
+        );
+        drop(key);
+        hkcu.delete_subkey_all(&path).expect("remove test key");
+        let _ = hkcu.delete_subkey(test_root);
     }
 }
