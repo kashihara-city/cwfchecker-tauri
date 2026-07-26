@@ -16,7 +16,7 @@ use std::{
         Arc, Mutex, RwLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{
     menu::{Menu, MenuBuilder, SubmenuBuilder},
@@ -35,6 +35,7 @@ const SETTINGS_LABEL: &str = "settings";
 const APP_TITLE: &str = "CreateWebFlowChecker";
 const NOTIFICATION_TITLE: &str = "電子決裁確認アプリ";
 const PORTLET_BOOTSTRAP_URL: &str = "http://tauri.localhost/portlet-bootstrap.html";
+const EXTERNAL_AUTH_WINDOW: Duration = Duration::from_secs(30);
 const PORTLET_POST_SCRIPT: &str = include_str!("../scripts/portlet-post.js");
 const WEBVIEW_SCRIPT: &str = include_str!("../scripts/cwf-scan.js");
 /// ダウンロード直後にShellExecuteで開くと危険な、実行・スクリプト系の拡張子。
@@ -67,8 +68,8 @@ pub struct AppState {
     portlet_navigation: Mutex<()>,
     /// 非同期のページ読込みが前後しても、最新の要求だけがPOSTを投入する。
     portlet_load: Mutex<PortletLoadState>,
-    /// SAML利用時に限り、認証完了までIdPへのHTTPSリダイレクトを許可する。
-    authentication_in_progress: AtomicBool,
+    /// SAML利用時の外部HTTPS遷移を、最初の遷移から一定時間だけ許可する。
+    authentication: Mutex<AuthenticationState>,
     decisions: AtomicUsize,
     decision_counter: AtomicUsize,
 }
@@ -85,6 +86,43 @@ impl PortletLoadState {
         }
         self.posted_generation = Some(generation);
         true
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AuthenticationState {
+    in_progress: bool,
+    external_deadline: Option<Instant>,
+}
+
+impl AuthenticationState {
+    fn begin(&mut self) {
+        self.in_progress = true;
+        self.external_deadline = None;
+    }
+
+    fn finish(&mut self) {
+        self.in_progress = false;
+        self.external_deadline = None;
+    }
+
+    fn finish_if_returned(&mut self) {
+        if self.external_deadline.is_some() {
+            self.finish();
+        }
+    }
+
+    fn allow_external_https(&mut self, url: &Url, now: Instant) -> bool {
+        if !self.in_progress || url.scheme() != "https" {
+            return false;
+        }
+        match self.external_deadline {
+            Some(deadline) => now <= deadline,
+            None => {
+                self.external_deadline = Some(now + EXTERNAL_AUTH_WINDOW);
+                true
+            }
+        }
     }
 }
 
@@ -238,19 +276,21 @@ fn begin_portlet_load(window: &WebviewWindow, state: &AppState) -> Result<(), St
         (previous, generation)
     };
     let bootstrap = portlet_bootstrap_url(generation)?;
-    let authentication_was_in_progress = state.authentication_in_progress.load(Ordering::Acquire);
-    state
-        .authentication_in_progress
-        .store(true, Ordering::Release);
+    let previous_authentication = {
+        let mut authentication = state.authentication.lock().map_err(|_| lock_error())?;
+        let previous = *authentication;
+        authentication.begin();
+        previous
+    };
     if let Err(error) = window.navigate(bootstrap) {
         if let Ok(mut load) = state.portlet_load.lock() {
             if load.active_generation == generation {
                 load.active_generation = previous_generation;
             }
         }
-        state
-            .authentication_in_progress
-            .store(authentication_was_in_progress, Ordering::Release);
+        if let Ok(mut authentication) = state.authentication.lock() {
+            *authentication = previous_authentication;
+        }
         return Err(error.to_string());
     }
     Ok(())
@@ -357,13 +397,25 @@ fn has_allowed_origin(url: &Url, allowed_origin: &str) -> bool {
     matches!(url.scheme(), "http" | "https") && url.origin().ascii_serialization() == allowed_origin
 }
 
+fn can_download_from_page(url: &Url, allowed_origin: &str) -> bool {
+    has_allowed_origin(url, allowed_origin)
+}
+
 fn configure_download(
     builder: WebviewWindowBuilder<'_, tauri::Wry, impl Manager<tauri::Wry>>,
     download_dir: PathBuf,
+    allowed_origin: String,
 ) -> WebviewWindowBuilder<'_, tauri::Wry, impl Manager<tauri::Wry>> {
-    builder.on_download(move |_webview, event| {
+    builder.on_download(move |webview, event| {
         match event {
             DownloadEvent::Requested { destination, .. } => {
+                // IdPや認証中に開いた外部ページからは、添付の自動保存・起動を許可しない。
+                if !webview
+                    .url()
+                    .is_ok_and(|url| can_download_from_page(&url, &allowed_origin))
+                {
+                    return false;
+                }
                 if fs::create_dir_all(&download_dir).is_err() {
                     return false;
                 }
@@ -456,6 +508,7 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
     let script = webview_script(&origin);
     let origin_for_main_navigation = origin.clone();
     let origin_for_popup = origin.clone();
+    let origin_for_main_download = origin.clone();
     let app_for_popup = app.clone();
     let state_for_navigation = state.clone();
     let state_for_page_load = state.clone();
@@ -479,6 +532,10 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
     .menu(menu)
     .on_navigation(move |url| {
         if has_allowed_origin(url, &origin_for_main_navigation) {
+            if let Ok(mut authentication) = state_for_navigation.authentication.lock() {
+                // 最初のPOST先では閉じず、IdP等へ一度出た後の帰還時だけ閉じる。
+                authentication.finish_if_returned();
+            }
             return true;
         }
         if let Some(generation) = portlet_load_generation(url) {
@@ -487,11 +544,13 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
                 .lock()
                 .is_ok_and(|load| load.active_generation == generation);
         }
-        // SAML認証中だけはIdPへのHTTPSリダイレクトを許可する。
+        // 最初の外部HTTPS遷移から30秒間だけSAML IdP等への遷移を許可する。
         state_for_navigation
-            .authentication_in_progress
-            .load(Ordering::Acquire)
-            && url.scheme() == "https"
+            .authentication
+            .lock()
+            .is_ok_and(|mut authentication| {
+                authentication.allow_external_https(url, Instant::now())
+            })
     })
     .on_menu_event(|window, event| {
         handle_window_menu(window, event.id().as_ref());
@@ -518,9 +577,11 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
                                 .lock()
                                 .is_ok_and(|load| load.active_generation == generation)
                             {
-                                state_for_page_load
-                                    .authentication_in_progress
-                                    .store(false, Ordering::Release);
+                                if let Ok(mut authentication) =
+                                    state_for_page_load.authentication.lock()
+                                {
+                                    authentication.finish();
+                                }
                             }
                             eprintln!("ポートレットのPOST開始に失敗しました: {error}");
                         }
@@ -531,9 +592,11 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
                             .lock()
                             .is_ok_and(|load| load.active_generation == generation)
                         {
-                            state_for_page_load
-                                .authentication_in_progress
-                                .store(false, Ordering::Release);
+                            if let Ok(mut authentication) =
+                                state_for_page_load.authentication.lock()
+                            {
+                                authentication.finish();
+                            }
                         }
                         eprintln!("ポートレットのPOST情報を作成できませんでした: {error}");
                     }
@@ -571,6 +634,7 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
             Err(_) => return NewWindowResponse::Deny,
         };
         let decision_origin = origin_for_popup.clone();
+        let decision_download_origin = origin_for_popup.clone();
         let decision = WebviewWindowBuilder::new(
             &app_for_popup,
             label,
@@ -586,7 +650,11 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
         .on_menu_event(|window, event| {
             handle_window_menu(window, event.id().as_ref());
         });
-        let decision = configure_download(decision, state_for_popup.download_dir.clone());
+        let decision = configure_download(
+            decision,
+            state_for_popup.download_dir.clone(),
+            decision_download_origin,
+        );
         match decision.build() {
             Ok(window) => {
                 state_for_popup.decisions.fetch_add(1, Ordering::Relaxed);
@@ -596,7 +664,7 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
             Err(_) => NewWindowResponse::Deny,
         }
     });
-    configure_download(builder, download_dir)
+    configure_download(builder, download_dir, origin_for_main_download)
         .build()
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -842,8 +910,10 @@ fn process_page_report(
     }
     // 設定サーバー上でレポートを受信できたので、以後の外部リダイレクトを閉じる。
     state
-        .authentication_in_progress
-        .store(false, Ordering::Release);
+        .authentication
+        .lock()
+        .map_err(|_| lock_error())?
+        .finish();
     let rows = report.decision_count.clamp(1, 30);
     let requested_height = if report.image_count > 0 && report.content_height > 0 {
         report.content_height
@@ -907,7 +977,10 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             active_generation: 1,
             posted_generation: None,
         }),
-        authentication_in_progress: AtomicBool::new(true),
+        authentication: Mutex::new(AuthenticationState {
+            in_progress: true,
+            external_deadline: None,
+        }),
         decisions: AtomicUsize::new(0),
         decision_counter: AtomicUsize::new(1),
     });
@@ -1036,16 +1109,16 @@ pub fn handle_shortcut(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_portlet_endpoint, cleanup_directory, has_allowed_origin, is_blocked_download,
-        is_portlet_bootstrap_url, parse_report_title, portlet_bootstrap_url,
-        portlet_load_generation, webview_script, PortletLoadState, NOTIFICATION_TITLE,
-        PORTLET_POST_SCRIPT,
+        build_portlet_endpoint, can_download_from_page, cleanup_directory, has_allowed_origin,
+        is_blocked_download, is_portlet_bootstrap_url, parse_report_title, portlet_bootstrap_url,
+        portlet_load_generation, webview_script, AuthenticationState, PortletLoadState,
+        EXTERNAL_AUTH_WINDOW, NOTIFICATION_TITLE, PORTLET_POST_SCRIPT,
     };
     use crate::settings::Settings;
     use std::{
         fs,
         path::Path,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
     use url::Url;
 
@@ -1104,6 +1177,52 @@ mod tests {
         ));
         assert!(!has_allowed_origin(
             &Url::parse("file:///C:/temp/test.html").expect("URL"),
+            allowed
+        ));
+    }
+
+    #[test]
+    fn allows_external_https_for_thirty_seconds_without_extending_the_deadline() {
+        let start = Instant::now();
+        let mut authentication = AuthenticationState {
+            in_progress: true,
+            external_deadline: None,
+        };
+        let idp = Url::parse("https://idp.example/login").expect("IdP URL");
+        let federation = Url::parse("https://federation.example/continue").expect("federation URL");
+
+        // 最初の設定先ページでは、まだ外部へ出ていないため認証試行を閉じない。
+        authentication.finish_if_returned();
+        assert!(authentication.in_progress);
+        assert!(authentication.allow_external_https(&idp, start));
+        let deadline = authentication.external_deadline;
+        assert_eq!(deadline, Some(start + EXTERNAL_AUTH_WINDOW));
+        assert!(authentication.allow_external_https(
+            &federation,
+            start + EXTERNAL_AUTH_WINDOW - Duration::from_secs(1)
+        ));
+        assert_eq!(authentication.external_deadline, deadline);
+        assert!(!authentication.allow_external_https(
+            &federation,
+            start + EXTERNAL_AUTH_WINDOW + Duration::from_millis(1)
+        ));
+
+        // 外部へ出た後、設定先へ戻った時点で期限前でも閉じる。
+        authentication.finish_if_returned();
+        assert!(!authentication.in_progress);
+        assert!(authentication.external_deadline.is_none());
+    }
+
+    #[test]
+    fn rejects_downloads_started_from_external_pages() {
+        let allowed = "https://workflow.example";
+
+        assert!(can_download_from_page(
+            &Url::parse("https://workflow.example/XFV20/decision").expect("CWF URL"),
+            allowed
+        ));
+        assert!(!can_download_from_page(
+            &Url::parse("https://idp.example/error").expect("IdP URL"),
             allowed
         ));
     }
