@@ -36,6 +36,8 @@ const APP_TITLE: &str = "CreateWebFlowChecker";
 const NOTIFICATION_TITLE: &str = "電子決裁確認アプリ";
 const PORTLET_BOOTSTRAP_URL: &str = "http://tauri.localhost/portlet-bootstrap.html";
 const EXTERNAL_AUTH_WINDOW: Duration = Duration::from_secs(30);
+const AUTHENTICATION_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+const RELOAD_FALLBACK_DELAY: Duration = Duration::from_secs(5);
 const PORTLET_POST_SCRIPT: &str = include_str!("../scripts/portlet-post.js");
 const WEBVIEW_SCRIPT: &str = include_str!("../scripts/cwf-scan.js");
 /// ダウンロード直後にShellExecuteで開くと危険な、実行・スクリプト系の拡張子。
@@ -85,37 +87,56 @@ pub struct AppState {
 ///
 /// `navigate()`は非同期なので、古いページの完了通知が新しい要求より後に届くことがある。
 /// 単純なtrue/falseでは区別できないため、要求ごとに増える世代番号を使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PortletLoadPhase {
+    Reloading,
+    Posting,
+    Complete,
+}
+
 struct PortletLoadState {
     active_generation: usize,
     posted_generation: Option<usize>,
+    phase: PortletLoadPhase,
 }
 
 impl PortletLoadState {
-    /// 次の世代を有効にし、失敗時に戻せるよう「変更前・変更後」を返す。
-    fn begin_next_generation(&mut self) -> (usize, usize) {
-        let previous = self.active_generation;
+    /// 次の世代を、Cookieを使った通常reloadとして開始する。
+    fn begin_next_generation(&mut self) -> usize {
         // 0と1は使わず、初回WebViewを世代1、明示的な再読込みを世代2以降にする。
-        let current = previous.wrapping_add(1).max(2);
+        let current = self.active_generation.wrapping_add(1).max(2);
         self.active_generation = current;
-        (previous, current)
+        self.phase = PortletLoadPhase::Reloading;
+        current
     }
 
     fn is_active(&self, generation: usize) -> bool {
         self.active_generation == generation
     }
 
-    /// この世代がまだ最新の場合だけ、navigate失敗前の世代へ戻す。
-    fn restore_if_active(&mut self, generation: usize, previous: usize) {
-        if self.is_active(generation) {
-            self.active_generation = previous;
+    /// 5秒後も同じ世代がreload待ちの場合だけ、POSTへの切替権を取得する。
+    fn begin_post_fallback(&mut self, generation: usize) -> bool {
+        if !self.is_active(generation) || self.phase != PortletLoadPhase::Reloading {
+            return false;
         }
+        self.phase = PortletLoadPhase::Posting;
+        true
+    }
+
+    fn is_posting(&self, generation: usize) -> bool {
+        self.is_active(generation) && self.phase == PortletLoadPhase::Posting
+    }
+
+    /// 現在の世代で認証成功DOMを確認し、待機中のフォールバックを無効にする。
+    fn mark_authenticated(&mut self) {
+        self.phase = PortletLoadPhase::Complete;
     }
 
     /// 最新世代のPOST実行権を一度だけ取得する。
     ///
     /// `true`を受け取った呼び出し元だけがPW入りフォームを作成してよい。
     fn claim_post(&mut self, generation: usize) -> bool {
-        if !self.is_active(generation) || self.posted_generation == Some(generation) {
+        if !self.is_posting(generation) || self.posted_generation == Some(generation) {
             return false;
         }
         self.posted_generation = Some(generation);
@@ -128,18 +149,28 @@ impl PortletLoadState {
 struct AuthenticationState {
     /// ポートレットPOSTから認証結果の受信までの間だけtrueになる。
     in_progress: bool,
+    /// 認証開始から数えて、この時刻を過ぎた外部遷移は最初の1回でも許可しない。
+    attempt_deadline: Option<Instant>,
     /// 最初の外部HTTPS遷移時に設定する固定期限。遷移のたびには延長しない。
     external_deadline: Option<Instant>,
 }
 
 impl AuthenticationState {
     /// 新しいポートレット読込みでは、前回の期限を必ず捨てて認証をやり直す。
-    fn begin(&mut self) {
+    fn begin(&mut self, now: Instant) {
         self.in_progress = true;
+        self.attempt_deadline = Some(now + AUTHENTICATION_ATTEMPT_WINDOW);
         self.external_deadline = None;
     }
 
     fn finish(&mut self) {
+        self.in_progress = false;
+        self.attempt_deadline = None;
+        self.external_deadline = None;
+    }
+
+    /// 外部遷移は閉じるが、同じ更新のPOSTフォールバックで使う絶対期限は残す。
+    fn close_external_navigation(&mut self) {
         self.in_progress = false;
         self.external_deadline = None;
     }
@@ -148,19 +179,40 @@ impl AuthenticationState {
         // `None`は「まだIdPへ出る前」なので、最初のPOST先到達では閉じない。
         // `Some`なら一度IdP等へ出た後なので、設定先へ戻った時点で閉じる。
         if self.external_deadline.is_some() {
-            self.finish();
+            self.close_external_navigation();
         }
+    }
+
+    /// reloadと同じ絶対期限のまま、POST用の外部遷移許可を開き直す。
+    fn resume_for_fallback(&mut self, now: Instant) -> bool {
+        if self.attempt_deadline.is_none_or(|deadline| now > deadline) {
+            self.finish();
+            return false;
+        }
+        self.in_progress = true;
+        self.external_deadline = None;
+        true
     }
 
     fn allow_external_https(&mut self, url: &Url, now: Instant) -> bool {
         if !self.in_progress || url.scheme() != "https" {
             return false;
         }
+        let Some(attempt_deadline) = self.attempt_deadline else {
+            self.finish();
+            return false;
+        };
+        if now > attempt_deadline {
+            // POST後に結果レポートが届かなくても、古い認証試行を後から再利用させない。
+            self.finish();
+            return false;
+        }
         match self.external_deadline {
             Some(deadline) => now <= deadline,
             None => {
-                // ここで一度だけ期限を決める。後続リダイレクトでは書き換えない。
-                self.external_deadline = Some(now + EXTERNAL_AUTH_WINDOW);
+                // ここで一度だけ期限を決める。開始からの絶対上限を越えないよう、
+                // 「外部へ出てから30秒」と「認証開始から60秒」の早い方を使う。
+                self.external_deadline = Some((now + EXTERNAL_AUTH_WINDOW).min(attempt_deadline));
                 true
             }
         }
@@ -309,31 +361,69 @@ fn portlet_post_script(state: &AppState, bootstrap_url: &str) -> Result<String, 
     Ok(format!("({PORTLET_POST_SCRIPT})({config});"))
 }
 
-/// 新しい世代を採番し、POST開始ページへの遷移を直列に開始する。
-fn begin_portlet_load(window: &WebviewWindow, state: &AppState) -> Result<(), String> {
-    // このガードは関数末尾まで保持し、別スレッドのnavigate呼出しが追い越さないようにする。
+/// reloadが5秒以内に認証成功しなかった場合だけ、従来のPOST読込みへ切り替える。
+fn begin_portlet_post(
+    window: &WebviewWindow,
+    state: &AppState,
+    generation: usize,
+) -> Result<(), String> {
+    // 世代確認からnavigateまでを直列化し、別の更新要求に追い越されないようにする。
     let _navigation = state.portlet_navigation.lock().map_err(|_| lock_error())?;
-    let (previous_generation, generation) = {
-        let mut load = state.portlet_load.lock().map_err(|_| lock_error())?;
-        load.begin_next_generation()
-    };
     let bootstrap = portlet_bootstrap_url(generation)?;
-    // navigate自体が失敗した場合は、呼出し前の認証状態も復元する。
-    let previous_authentication = {
-        let mut authentication = state.authentication.lock().map_err(|_| lock_error())?;
-        let previous = *authentication;
-        authentication.begin();
-        previous
-    };
+    let should_post = state
+        .portlet_load
+        .lock()
+        .map_err(|_| lock_error())?
+        .begin_post_fallback(generation);
+    if !should_post {
+        // 認証成功済み、または新しい更新が始まっているため、このタイマーは何もしない。
+        return Ok(());
+    }
+    if !state
+        .authentication
+        .lock()
+        .map_err(|_| lock_error())?
+        .resume_for_fallback(Instant::now())
+    {
+        return Err("認証試行の有効期限が切れました。".to_owned());
+    }
     if let Err(error) = window.navigate(bootstrap) {
-        if let Ok(mut load) = state.portlet_load.lock() {
-            load.restore_if_active(generation, previous_generation);
-        }
-        if let Ok(mut authentication) = state.authentication.lock() {
-            *authentication = previous_authentication;
-        }
+        finish_authentication_if_active_load(state, generation);
         return Err(error.to_string());
     }
+    Ok(())
+}
+
+/// 新しい世代を採番し、現在のページを無条件にreloadする。
+fn begin_portlet_load(window: &WebviewWindow, state: Arc<AppState>) -> Result<(), String> {
+    let (generation, reload_result) = {
+        // reload要求と世代採番の順序を一致させる。
+        let _navigation = state.portlet_navigation.lock().map_err(|_| lock_error())?;
+        let generation = state
+            .portlet_load
+            .lock()
+            .map_err(|_| lock_error())?
+            .begin_next_generation();
+        state
+            .authentication
+            .lock()
+            .map_err(|_| lock_error())?
+            .begin(Instant::now());
+        // reloadはon_navigationを同期的に呼ぶ可能性があるため、各状態のガードは手放しておく。
+        (generation, window.reload())
+    };
+    if let Err(error) = reload_result {
+        eprintln!("通常reloadを開始できなかったためPOSTへ切り替えます: {error}");
+        return begin_portlet_post(window, &state, generation);
+    }
+
+    let window = window.clone();
+    thread::spawn(move || {
+        thread::sleep(RELOAD_FALLBACK_DELAY);
+        if let Err(error) = begin_portlet_post(&window, &state, generation) {
+            eprintln!("通常reload後のPOSTフォールバックに失敗しました: {error}");
+        }
+    });
     Ok(())
 }
 
@@ -462,6 +552,17 @@ fn can_download_from_page(url: &Url, allowed_origin: &str) -> bool {
     has_allowed_origin(url, allowed_origin)
 }
 
+/// 完了したファイルが、実体として管理対象のダウンロードフォルダー内にあるか確認する。
+fn is_managed_download(path: &Path, download_dir: &Path) -> bool {
+    let Ok(path) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(download_dir) = fs::canonicalize(download_dir) else {
+        return false;
+    };
+    path != download_dir && path.starts_with(download_dir)
+}
+
 /// 添付の保存先、危険拡張子、ダウンロード後の自動起動を各WebViewへ設定する。
 fn configure_download(
     builder: WebviewWindowBuilder<'_, tauri::Wry, impl Manager<tauri::Wry>>,
@@ -498,8 +599,14 @@ fn configure_download(
                 path: Some(path),
                 success: true,
                 ..
-            } if !is_blocked_download(&path) => {
-                // Requested側を迂回する予期しないイベントにも備え、開く直前にも確認する。
+            } if !is_blocked_download(&path)
+                && is_managed_download(&path, &download_dir)
+                && webview
+                    .url()
+                    .is_ok_and(|url| can_download_from_page(&url, &allowed_origin)) =>
+            {
+                // Requested後にページや保存先が変わった場合にも備え、
+                // Windowsで開く直前にオリジン・保存先・拡張子をすべて再確認する。
                 let _ = open_external(&path.to_string_lossy());
             }
             _ => {}
@@ -512,7 +619,7 @@ fn configure_download(
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_LABEL) {
         if let Some(state) = app.try_state::<Arc<AppState>>() {
-            let _ = begin_portlet_load(&window, &state);
+            let _ = begin_portlet_load(&window, state.inner().clone());
         }
         let _ = window.show();
         let _ = window.set_focus();
@@ -611,7 +718,7 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
             return state_for_navigation
                 .portlet_load
                 .lock()
-                .is_ok_and(|load| load.is_active(generation));
+                .is_ok_and(|load| load.is_posting(generation));
         }
         // 3. その他は、最初の外部HTTPS遷移から30秒間だけSAML IdP等を許可する。
         state_for_navigation
@@ -784,7 +891,7 @@ fn start_timer(app: AppHandle, state: Arc<AppState>) {
             continue;
         }
         if let Some(window) = app.get_webview_window(MAIN_LABEL) {
-            let _ = begin_portlet_load(&window, &state);
+            let _ = begin_portlet_load(&window, state.clone());
         }
     });
 }
@@ -966,12 +1073,26 @@ fn process_page_report(
     if actual != expected {
         return Err("許可されていないオリジンです。".to_owned());
     }
-    // 設定サーバー上でレポートを受信できたので、以後の外部リダイレクトを閉じる。
-    state
-        .authentication
-        .lock()
-        .map_err(|_| lock_error())?
-        .finish();
+    if report.auth_count > 0 {
+        // 認証成功DOMを確認できた世代では、5秒タイマーからPOSTへ切り替えない。
+        state
+            .portlet_load
+            .lock()
+            .map_err(|_| lock_error())?
+            .mark_authenticated();
+        state
+            .authentication
+            .lock()
+            .map_err(|_| lock_error())?
+            .finish();
+    } else {
+        // 同一オリジンのエラー画面等では外部遷移だけ閉じ、POSTへ引き継ぐ絶対期限は残す。
+        state
+            .authentication
+            .lock()
+            .map_err(|_| lock_error())?
+            .close_external_navigation();
+    }
     let rows = report.decision_count.clamp(1, 30);
     let requested_height = if report.image_count > 0 && report.content_height > 0 {
         report.content_height
@@ -1035,10 +1156,12 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         portlet_load: Mutex::new(PortletLoadState {
             active_generation: 1,
             posted_generation: None,
+            phase: PortletLoadPhase::Posting,
         }),
         // WebView生成時の最初のPOSTでもSAMLへ進めるよう、認証試行中から始める。
         authentication: Mutex::new(AuthenticationState {
             in_progress: true,
+            attempt_deadline: Some(Instant::now() + AUTHENTICATION_ATTEMPT_WINDOW),
             external_deadline: None,
         }),
         decisions: AtomicUsize::new(0),
@@ -1080,7 +1203,7 @@ fn handle_window_menu(window: &tauri::Window, id: &str) {
             if let Some(webview) = app.get_webview_window(window.label()) {
                 if window.label() == MAIN_LABEL {
                     if let Some(state) = app.try_state::<Arc<AppState>>() {
-                        let _ = begin_portlet_load(&webview, &state);
+                        let _ = begin_portlet_load(&webview, state.inner().clone());
                     }
                 } else {
                     let _ = webview.eval("window.location.reload()");
@@ -1170,9 +1293,10 @@ pub fn handle_shortcut(
 mod tests {
     use super::{
         build_portlet_endpoint, can_download_from_page, cleanup_directory, has_allowed_origin,
-        is_blocked_download, is_portlet_bootstrap_url, parse_report_title, portlet_bootstrap_url,
-        portlet_load_generation, webview_script, AuthenticationState, PortletLoadState,
-        EXTERNAL_AUTH_WINDOW, NOTIFICATION_TITLE, PORTLET_POST_SCRIPT,
+        is_blocked_download, is_managed_download, is_portlet_bootstrap_url, parse_report_title,
+        portlet_bootstrap_url, portlet_load_generation, webview_script, AuthenticationState,
+        PortletLoadPhase, PortletLoadState, AUTHENTICATION_ATTEMPT_WINDOW, EXTERNAL_AUTH_WINDOW,
+        NOTIFICATION_TITLE, PORTLET_POST_SCRIPT,
     };
     use crate::settings::Settings;
     use std::{
@@ -1246,6 +1370,7 @@ mod tests {
         let start = Instant::now();
         let mut authentication = AuthenticationState {
             in_progress: true,
+            attempt_deadline: Some(start + AUTHENTICATION_ATTEMPT_WINDOW),
             external_deadline: None,
         };
         let idp = Url::parse("https://idp.example/login").expect("IdP URL");
@@ -1271,6 +1396,46 @@ mod tests {
         authentication.finish_if_returned();
         assert!(!authentication.in_progress);
         assert!(authentication.external_deadline.is_none());
+        // 同じ更新のPOSTフォールバックで再開できるよう、絶対期限は保持する。
+        assert_eq!(
+            authentication.attempt_deadline,
+            Some(start + AUTHENTICATION_ATTEMPT_WINDOW)
+        );
+        assert!(authentication.resume_for_fallback(start + Duration::from_secs(5)));
+        assert!(authentication.in_progress);
+        assert_eq!(
+            authentication.attempt_deadline,
+            Some(start + AUTHENTICATION_ATTEMPT_WINDOW)
+        );
+        authentication.finish();
+        assert!(authentication.attempt_deadline.is_none());
+    }
+
+    #[test]
+    fn rejects_external_https_after_the_authentication_attempt_deadline() {
+        let start = Instant::now();
+        let mut authentication = AuthenticationState {
+            in_progress: false,
+            attempt_deadline: None,
+            external_deadline: None,
+        };
+        let idp = Url::parse("https://idp.example/login").expect("IdP URL");
+
+        authentication.begin(start);
+        let late_first_navigation = start + AUTHENTICATION_ATTEMPT_WINDOW - Duration::from_secs(10);
+        assert!(authentication.allow_external_https(&idp, late_first_navigation));
+        // 外部遷移が遅く始まっても、30秒を足して絶対上限を越えてはならない。
+        assert_eq!(
+            authentication.external_deadline,
+            Some(start + AUTHENTICATION_ATTEMPT_WINDOW)
+        );
+        assert!(!authentication.allow_external_https(
+            &idp,
+            start + AUTHENTICATION_ATTEMPT_WINDOW + Duration::from_millis(1)
+        ));
+        assert!(!authentication.in_progress);
+        assert!(authentication.attempt_deadline.is_none());
+        assert!(authentication.external_deadline.is_none());
     }
 
     #[test]
@@ -1285,6 +1450,30 @@ mod tests {
             &Url::parse("https://idp.example/error").expect("IdP URL"),
             allowed
         ));
+    }
+
+    #[test]
+    fn accepts_only_completed_downloads_inside_the_managed_directory() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cwfchecker-download-check-{}-{nonce}",
+            std::process::id()
+        ));
+        let managed = root.join("managed");
+        let outside = root.join("outside.pdf");
+        let inside = managed.join("inside.pdf");
+        fs::create_dir_all(&managed).expect("create managed directory");
+        fs::write(&inside, b"inside").expect("write managed file");
+        fs::write(&outside, b"outside").expect("write outside file");
+
+        assert!(is_managed_download(&inside, &managed));
+        assert!(!is_managed_download(&outside, &managed));
+        assert!(!is_managed_download(&managed, &managed));
+
+        fs::remove_dir_all(root).expect("remove test root");
     }
 
     #[test]
@@ -1334,21 +1523,41 @@ mod tests {
     }
 
     #[test]
-    fn only_the_latest_portlet_load_can_post_once() {
+    fn reload_falls_back_to_post_only_once_for_the_latest_generation() {
         let mut load = PortletLoadState {
             active_generation: 8,
             posted_generation: Some(7),
+            phase: PortletLoadPhase::Posting,
         };
 
         assert!(!load.claim_post(7));
         assert!(load.claim_post(8));
         assert!(!load.claim_post(8));
 
-        let (previous, current) = load.begin_next_generation();
-        assert_eq!((previous, current), (8, 9));
+        let current = load.begin_next_generation();
+        assert_eq!(current, 9);
         assert!(load.is_active(9));
-        load.restore_if_active(9, previous);
-        assert!(load.is_active(8));
+        assert_eq!(load.phase, PortletLoadPhase::Reloading);
+        assert!(!load.claim_post(9));
+        assert!(!load.begin_post_fallback(8));
+        assert!(load.begin_post_fallback(9));
+        assert!(!load.begin_post_fallback(9));
+        assert!(load.claim_post(9));
+        assert!(!load.claim_post(9));
+    }
+
+    #[test]
+    fn authentication_report_stops_the_reload_fallback() {
+        let mut load = PortletLoadState {
+            active_generation: 12,
+            posted_generation: Some(11),
+            phase: PortletLoadPhase::Reloading,
+        };
+
+        load.mark_authenticated();
+
+        assert_eq!(load.phase, PortletLoadPhase::Complete);
+        assert!(!load.begin_post_fallback(12));
     }
 
     #[test]
