@@ -628,10 +628,11 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
         if !matches!(payload.event(), PageLoadEvent::Finished) {
             return;
         }
-        let Ok(current_url) = window.url() else {
-            return;
-        };
-        if let Some(generation) = portlet_load_generation(&current_url) {
+        // `window.url()`は、イベント発生後に別ページへ進んでいると新しいURLを返す。
+        // 遅れて届いた完了イベントを正しい読込み世代と結び付けるため、
+        // このイベント自身が持つURLを使う。
+        let current_url = payload.url();
+        if let Some(generation) = portlet_load_generation(current_url) {
             // 最新世代の遷移につき一度だけ、PWをPOST本文へ載せる。
             // MutexGuardを`should_post`の計算で手放してからevalするため、
             // eval中のコールバックが同じMutexを取得してもデッドロックしない。
@@ -653,7 +654,7 @@ fn create_main_window(app: &AppHandle, state: Arc<AppState>, endpoint: Url) -> R
                     }
                 }
             }
-        } else if has_allowed_origin(&current_url, &origin) {
+        } else if has_allowed_origin(current_url, &origin) {
             let _ = window.eval("window.__cwfScan?.()");
         }
     })
