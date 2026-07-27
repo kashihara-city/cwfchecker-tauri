@@ -14,6 +14,7 @@ const fields = {
 };
 
 const status = document.querySelector("#status");
+const version = document.querySelector("#app-version");
 const form = document.querySelector("#settings-form");
 const submitButton = form.querySelector('button[type="submit"]');
 
@@ -34,6 +35,7 @@ async function load() {
     fields.intervalMinutes.value = settings.intervalMinutes ?? 15;
     fields.notifyByBar.checked = Boolean(settings.notifyByBar);
     fields.shortcut.value = settings.shortcut || "F3";
+    version.textContent = settings.version || "—";
   } catch (error) {
     showStatus(String(error), true);
   }

@@ -38,6 +38,7 @@ pub use ui::{handle_shortcut, handle_window_event};
 const MAIN_LABEL: &str = "main";
 const SETTINGS_LABEL: &str = "settings";
 const APP_TITLE: &str = "CreateWebFlowChecker";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const NOTIFICATION_TITLE: &str = "電子決裁確認アプリ";
 
 /// OS差を吸収するTauriプラグインを通してWindows通知を表示する。
@@ -97,6 +98,7 @@ pub struct SettingsView {
     interval_minutes: u32,
     notify_by_bar: bool,
     shortcut: String,
+    version: &'static str,
 }
 
 fn lock_error() -> String {
@@ -184,6 +186,7 @@ pub fn get_settings(
         interval_minutes: settings.interval_minutes,
         notify_by_bar: settings.notify_by_bar,
         shortcut: settings.shortcut,
+        version: APP_VERSION,
     })
 }
 
@@ -342,7 +345,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_portlet_endpoint, has_allowed_origin, NOTIFICATION_TITLE};
+    use super::{build_portlet_endpoint, has_allowed_origin, APP_VERSION, NOTIFICATION_TITLE};
     use crate::settings::Settings;
     use url::Url;
 
@@ -383,5 +386,10 @@ mod tests {
     #[test]
     fn uses_the_japanese_notification_title() {
         assert_eq!(NOTIFICATION_TITLE, "電子決裁確認アプリ");
+    }
+
+    #[test]
+    fn exposes_the_cargo_package_version() {
+        assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
     }
 }

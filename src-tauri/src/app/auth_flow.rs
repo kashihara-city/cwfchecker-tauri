@@ -18,7 +18,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, PhysicalPosition, PhysicalSize, WebviewWindow};
+use tauri::{AppHandle, LogicalSize, PhysicalPosition, WebviewWindow};
 use url::Url;
 
 const PORTLET_BOOTSTRAP_URL: &str = "http://tauri.localhost/portlet-bootstrap.html";
@@ -29,6 +29,9 @@ const LOAD_GENERATION_PREFIX: &str = "__CWFCHECKER_LOAD__";
 const LOAD_GENERATION_STORAGE_KEY: &str = "__cwfcheckerLoadGeneration";
 const PORTLET_POST_SCRIPT: &str = include_str!("../../scripts/portlet-post.js");
 const WEBVIEW_SCRIPT: &str = include_str!("../../scripts/cwf-scan.js");
+const MAIN_WINDOW_LOGICAL_WIDTH: f64 = 600.0;
+const SCREEN_EDGE_RESERVE_LOGICAL_HEIGHT: f64 = 60.0;
+const CONTENT_HEIGHT_ROUNDING_MARGIN: f64 = 2.0;
 
 /// どのポートレット再読込みが現在有効かを表す。
 ///
@@ -452,6 +455,35 @@ pub(super) fn parse_report_title(title: &str) -> Option<PageReport> {
     })
 }
 
+/// CSSピクセルで測った内容の寸法を、Windowsの表示倍率に追従する論理サイズへ変換する。
+///
+/// CSSピクセルとTauriの論理ピクセルを同じ寸法として扱い、実際の物理サイズへの
+/// 変換はTauriとWindowsへ任せる。画面上限だけ物理pxから論理pxへ直す。
+fn main_window_logical_size(
+    requested_content_height: usize,
+    monitor_physical_height: Option<u32>,
+    scale_factor: f64,
+) -> LogicalSize<f64> {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    // CSSレイアウトとネイティブウィンドウの端数丸めで1pxだけ不足し、
+    // スクロールバーが出ることを避けるため、わずかな余裕を持たせる。
+    let requested_height = requested_content_height as f64 + CONTENT_HEIGHT_ROUNDING_MARGIN;
+    let maximum_height = monitor_physical_height
+        .map(|height| {
+            (f64::from(height) / scale_factor - SCREEN_EDGE_RESERVE_LOGICAL_HEIGHT).max(1.0)
+        })
+        .unwrap_or(requested_height);
+
+    LogicalSize::new(
+        MAIN_WINDOW_LOGICAL_WIDTH,
+        requested_height.min(maximum_height),
+    )
+}
+
 /// WebViewから受けた調査結果を、認証状態、ウィンドウサイズ、通知へ反映する。
 pub(super) fn process_page_report(
     app: &AppHandle,
@@ -493,16 +525,15 @@ pub(super) fn process_page_report(
     } else {
         290 + rows * 35
     };
-    let maximum_height = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .map(|monitor| monitor.size().height.saturating_sub(60) as usize)
-        .unwrap_or(requested_height);
-    let height = requested_height.min(maximum_height);
-    window
-        .set_size(PhysicalSize::new(600, height as u32))
-        .map_err(|error| error.to_string())?;
+    let monitor = window.current_monitor().ok().flatten();
+    let monitor_physical_height = monitor.as_ref().map(|monitor| monitor.size().height);
+    let scale_factor = monitor
+        .as_ref()
+        .map(|monitor| monitor.scale_factor())
+        .or_else(|| window.scale_factor().ok())
+        .unwrap_or(1.0);
+    let size = main_window_logical_size(requested_height, monitor_physical_height, scale_factor);
+    window.set_size(size).map_err(|error| error.to_string())?;
     let _ = window.set_position(PhysicalPosition::new(0, 0));
 
     if report.decision_count > 0 {
@@ -546,6 +577,37 @@ mod tests {
         assert_eq!(report.image_count, 2);
         assert_eq!(report.content_height, 746);
         assert_eq!(report.count_text, "3");
+    }
+
+    #[test]
+    fn keeps_css_dimensions_as_logical_pixels_at_each_display_scale() {
+        for scale_factor in [1.0, 1.25, 1.5, 1.75] {
+            let size = main_window_logical_size(746, Some(2160), scale_factor);
+            let physical: tauri::PhysicalSize<u32> = size.to_physical(scale_factor);
+
+            assert_eq!(size.width, 600.0);
+            assert_eq!(size.height, 748.0);
+            assert_eq!(
+                physical.width,
+                (MAIN_WINDOW_LOGICAL_WIDTH * scale_factor).round() as u32
+            );
+            assert_eq!(physical.height, (748.0 * scale_factor).round() as u32);
+        }
+    }
+
+    #[test]
+    fn converts_the_physical_monitor_limit_to_logical_pixels() {
+        let size = main_window_logical_size(900, Some(1080), 1.25);
+
+        assert_eq!(size.width, 600.0);
+        assert_eq!(size.height, 804.0);
+    }
+
+    #[test]
+    fn ignores_an_invalid_display_scale() {
+        let size = main_window_logical_size(746, Some(1080), 0.0);
+
+        assert_eq!(size.height, 748.0);
     }
 
     #[test]
@@ -603,6 +665,7 @@ mod tests {
         assert!(script.contains("sessionStorage"));
         assert!(script.contains("window.__cwfScanRunning || window.__cwfScanReported"));
         assert!(script.contains("window.__cwfScanReported = true;"));
+        assert!(script.contains("root.style.overflowY = \"hidden\""));
         assert!(reload_script.contains("\"42\""));
         assert!(reload_script.contains("window.location.reload()"));
         assert!(PORTLET_POST_SCRIPT.contains("window.name = config.windowName"));

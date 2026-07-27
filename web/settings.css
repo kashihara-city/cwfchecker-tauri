@@ -85,3 +85,10 @@ button {
 button:hover { background: #1d4ed8; }
 #status { min-height: 20px; margin: 0; color: #166534; }
 #status.error { color: #b91c1c; }
+
+.app-version {
+  margin: 20px 0 0;
+  color: #6b7280;
+  font-size: 12px;
+  text-align: center;
+}
