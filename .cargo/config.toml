@@ -1,0 +1,3 @@
+# 利用端末にVisual C++再頒布可能パッケージを要求しないよう、CRTを静的リンクする。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

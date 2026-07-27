@@ -23,12 +23,8 @@ Windows向けデスクトップアプリケーションです。
 
 - Windows 11
 - Microsoft Edge WebView2 Runtime
-- Microsoft Visual C++ 再頒布可能パッケージ（x64版、`VC_redist.x64.exe`）
 - Create!Webフローのポートレット表示オプションが利用可能であること
 - ポートレット画面のHTTPまたはHTTPS URLを指定できること
-
-`VC_redist.x64.exe`が未導入の環境では、本アプリを起動する前に
-Microsoft Visual C++ 再頒布可能パッケージのx64版をインストールしてください。
 
 本アプリはインフォテック社の公認・許諾を受けた製品ではありません。
 利用環境のCreate!Webフローに対する動作確認を行ったうえで使用してください。
@@ -63,7 +59,8 @@ HKCU
 └─ Software
    ├─ KashiharaCity
    │  └─ CwfChecker
-   │     └─ 通常のアプリ設定
+   │     ├─ 一般の設定
+   │     └─ GPO管理用の設定
    │
    └─ Classes
       └─ AppUserModelId
@@ -71,9 +68,9 @@ HKCU
             └─ 通知バー用の設定
 ```
 
-### 通常のアプリ設定
+### 一般の設定
 
-アプリが保存する通常の設定です。
+アプリが保存する一般的な設定です。
 
 ```text
 HKEY_CURRENT_USER\Software\KashiharaCity\CwfChecker
@@ -130,7 +127,7 @@ IDを`SAML`にした場合は資格情報を保存せず、POST時だけ`SAML/SA
 通常認証からSAMLへ切り替えた場合、既存の資格情報は障害時の切り戻し用として残しますが、
 SAML動作中には読み取りもPOSTも行いません。
 
-### GPOで事前配布できる設定
+### GPO管理用の設定（一般設定と一部共通）
 
 Tauri版の配布前にGPOで設定を管理する場合は、主に次の項目を設定します。
 
@@ -139,7 +136,7 @@ Tauri版の配布前にGPOで設定を管理する場合は、主に次の項目
 | `CwfAddress`     | `REG_SZ`    | 実際のCreate!WebフローのポートレットURL                                                                                                |
 | `AdServer`       | `REG_SZ`    | 通常認証で使用するAD Server。SAMLでは省略可能                                                                                          |
 | `Id`             | `REG_SZ`    | SAML端末では`SAML`。通常認証では省略可能                                                                                               |
-| `SchemaVersion`  | `REG_DWORD` | `1` 固定。無い場合、通常のアプリ設定は未設定として扱われます                                                                           |
+| `SchemaVersion`  | `REG_DWORD` | `1` 固定。無い場合、一般のアプリ設定は未設定として扱われます                                                                           |
 | `LatestVersion`  | `REG_SZ`    | 最新バージョン（オプション、それより古いバージョンを起動するとメニューに「更新あり」と表示されます）                                   |
 | `MinimumVersion` | `REG_SZ`    | 最低バージョン（オプション、それより古いバージョンを起動すると「新しいバージョンが出ています。更新してください」と表示し、終了します） |
 
