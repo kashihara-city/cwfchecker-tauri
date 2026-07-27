@@ -16,6 +16,10 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{ShortcutEvent, ShortcutState};
 
+const APP_MENU_LABEL: &str = "⚙ メニュー　";
+const RELOAD_MENU_LABEL: &str = "↻ 更新　";
+const CLOSE_MENU_LABEL: &str = "× 閉じる　";
+
 /// メイン画面があれば再読込して前面へ出し、未設定なら設定画面を開く。
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(MAIN_LABEL) {
@@ -79,15 +83,15 @@ pub(super) fn build_window_menu(
     app: &AppHandle,
     window_label: &str,
 ) -> tauri::Result<Menu<tauri::Wry>> {
-    let app_menu = SubmenuBuilder::new(app, "メニュー")
+    let app_menu = SubmenuBuilder::new(app, APP_MENU_LABEL)
         .text(format!("settings:{window_label}"), "設定画面")
         .separator()
         .text(format!("quit:{window_label}"), "アプリ終了")
         .build()?;
     MenuBuilder::new(app)
         .item(&app_menu)
-        .text(format!("reload:{window_label}"), "更新")
-        .text(format!("close:{window_label}"), "閉じる")
+        .text(format!("reload:{window_label}"), RELOAD_MENU_LABEL)
+        .text(format!("close:{window_label}"), CLOSE_MENU_LABEL)
         .build()
 }
 
