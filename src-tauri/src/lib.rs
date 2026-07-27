@@ -3,6 +3,11 @@
 //! 小さな`main.rs`からこの`run`関数を呼び、Tauriプラグインとアプリ固有の
 //! コールバックを組み立てる。実際の画面処理は`app`モジュールへ分離している。
 
+#[cfg(all(target_os = "windows", not(doc), not(target_feature = "crt-static")))]
+compile_error!(
+    "Windows版はVisual C++再頒布可能パッケージを不要にするため、CRTの静的リンクが必須です。"
+);
+
 mod app;
 mod credentials;
 mod migration;
@@ -14,6 +19,8 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 起動を拒否される古い版ほど更新対象として把握する必要があるため、
+    // MinimumVersionの判定より先に、実行された版をAppVersionへ記録する。
     if let Err(error) = version_policy::register_current_version() {
         registry_support::show_registry_error(
             "アプリバージョンの登録",
@@ -22,11 +29,15 @@ pub fn run() {
         );
     }
     match version_policy::read_status() {
-        Ok(status) if status.minimum_not_met => {
-            registry_support::show_minimum_version_required();
-            return;
+        Ok(status) => {
+            if let Some(minimum) = status.minimum_required {
+                registry_support::show_minimum_version_required(
+                    version_policy::CURRENT_VERSION,
+                    &minimum,
+                );
+                return;
+            }
         }
-        Ok(_) => {}
         Err(error) => {
             // GPO値の読取り失敗で全利用者を起動不能にしない。
             eprintln!("バージョン方針を読み込めないため通常起動します: {error}");

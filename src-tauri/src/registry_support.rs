@@ -55,9 +55,13 @@ pub fn show_update_available() {
     show_message("新しいバージョンが配信されています", MB_ICONINFORMATION);
 }
 
-pub fn show_minimum_version_required() {
+fn format_minimum_version_required(current: &str, minimum: &str) -> String {
+    format!("現在のバージョン {current} は、必要な最低バージョン {minimum} を満たしていません。")
+}
+
+pub fn show_minimum_version_required(current: &str, minimum: &str) {
     show_message(
-        "新しいバージョンが出ています。更新してください",
+        &format_minimum_version_required(current, minimum),
         MB_ICONWARNING,
     );
 }
@@ -140,7 +144,9 @@ pub fn ensure_notification_registration() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_icon_in, format_registry_error, NOTIFICATION_ICON};
+    use super::{
+        ensure_icon_in, format_minimum_version_required, format_registry_error, NOTIFICATION_ICON,
+    };
     use std::{fs, io, time::SystemTime};
 
     fn test_directory(name: &str) -> std::path::PathBuf {
@@ -162,6 +168,14 @@ mod tests {
         assert!(message.contains("アプリ設定の保存"));
         assert!(message.contains(r"HKCU\Software\KashiharaCity\CwfChecker"));
         assert!(message.contains("アクセスが拒否されました"));
+    }
+
+    #[test]
+    fn formats_the_required_and_current_versions() {
+        assert_eq!(
+            format_minimum_version_required("0.1.4", "0.2.0"),
+            "現在のバージョン 0.1.4 は、必要な最低バージョン 0.2.0 を満たしていません。"
+        );
     }
 
     #[test]

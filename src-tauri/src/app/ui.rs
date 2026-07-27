@@ -94,7 +94,10 @@ pub(super) fn build_window_menu(
         .text(format!("reload:{window_label}"), RELOAD_MENU_LABEL)
         .text(format!("close:{window_label}"), CLOSE_MENU_LABEL);
     if version_policy::read_status().is_ok_and(|status| status.update_available) {
-        menu = menu.text(format!("update-available:{window_label}"), "更新あり");
+        menu = menu.text(
+            format!("update-available:{window_label}"),
+            "⬆ アップデートあり",
+        );
     }
     menu.build()
 }

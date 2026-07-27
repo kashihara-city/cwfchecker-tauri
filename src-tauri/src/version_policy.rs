@@ -65,10 +65,10 @@ impl PartialOrd for Version {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct PolicyStatus {
     pub update_available: bool,
-    pub minimum_not_met: bool,
+    pub minimum_required: Option<String>,
 }
 
 fn evaluate(
@@ -77,11 +77,14 @@ fn evaluate(
     minimum: Option<&str>,
 ) -> Result<PolicyStatus, String> {
     let current = Version::parse(current)?;
-    let latest = latest.map(Version::parse).transpose()?;
-    let minimum = minimum.map(Version::parse).transpose()?;
+    let latest_version = latest.map(Version::parse).transpose()?;
+    let minimum_version = minimum.map(Version::parse).transpose()?;
     Ok(PolicyStatus {
-        update_available: latest.is_some_and(|version| current < version),
-        minimum_not_met: minimum.is_some_and(|version| current < version),
+        update_available: latest_version.is_some_and(|version| current < version),
+        minimum_required: minimum
+            .zip(minimum_version)
+            .filter(|(_, version)| current < *version)
+            .map(|(value, _)| value.trim().to_owned()),
     })
 }
 
@@ -175,25 +178,26 @@ mod tests {
             evaluate("1.2.3", Some("1.3.0"), Some("1.0")).unwrap(),
             PolicyStatus {
                 update_available: true,
-                minimum_not_met: false,
+                minimum_required: None,
             }
         );
         assert_eq!(
             evaluate("1.2.3", Some("1.2.3"), Some("2.0")).unwrap(),
             PolicyStatus {
                 update_available: false,
-                minimum_not_met: true,
+                minimum_required: Some("2.0".to_owned()),
             }
         );
     }
 
     #[test]
     fn registers_and_reads_policy_values_in_an_isolated_key() {
+        let test_root = r"Software\KashiharaCity\CwfCheckerTests";
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = format!(r"Software\KashiharaCity\CwfCheckerTest\{nonce}");
+        let path = format!(r"{test_root}\{nonce}");
         register_current_version_at(&path).expect("register current version");
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let key = hkcu
@@ -209,10 +213,11 @@ mod tests {
             read_status_at(&path).unwrap(),
             PolicyStatus {
                 update_available: true,
-                minimum_not_met: false,
+                minimum_required: None,
             }
         );
         drop(key);
         hkcu.delete_subkey_all(&path).expect("remove test key");
+        let _ = hkcu.delete_subkey(test_root);
     }
 }
