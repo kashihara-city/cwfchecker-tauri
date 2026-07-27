@@ -56,7 +56,10 @@ pub fn show_update_available() {
 }
 
 fn format_minimum_version_required(current: &str, minimum: &str) -> String {
-    format!("現在のバージョン {current} は、必要な最低バージョン {minimum} を満たしていません。")
+    format!(
+        "現在のバージョン {current} は、必要な最低バージョン {minimum} を満たしていません。\n\
+         アプリを更新してください。"
+    )
 }
 
 pub fn show_minimum_version_required(current: &str, minimum: &str) {
@@ -174,7 +177,8 @@ mod tests {
     fn formats_the_required_and_current_versions() {
         assert_eq!(
             format_minimum_version_required("0.1.4", "0.2.0"),
-            "現在のバージョン 0.1.4 は、必要な最低バージョン 0.2.0 を満たしていません。"
+            "現在のバージョン 0.1.4 は、必要な最低バージョン 0.2.0 を満たしていません。\n\
+             アプリを更新してください。"
         );
     }
 

@@ -23,6 +23,8 @@ const VALUE_SCHEMA_VERSION: &str = "SchemaVersion";
 const LEGACY_MIGRATION_VALUE: &str = "LegacyMigrationVersion";
 pub const SAML_ID: &str = "SAML";
 pub const MAX_INTERVAL_MINUTES: u32 = 360;
+// 同じキーにあるAppVersion・LatestVersion・MinimumVersionはversion_policyの管理値。
+// 一般設定の保存失敗時にGPO値や実行版の記録を巻き戻さないため、ここには含めない。
 const SETTINGS_VALUE_NAMES: [&str; 8] = [
     VALUE_ID,
     VALUE_AD_SERVER,
@@ -175,6 +177,8 @@ pub fn mark_legacy_migrated() -> io::Result<()> {
 /// 現行SchemaVersionの設定を読む。キーなし・未完成・旧形式は`None`を返す。
 pub fn read() -> io::Result<Option<Settings>> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    // AppVersionの登録だけでも起動時にキーが作られるため、キーの存在を設定済みの
+    // 判定には使えない。保存完了マーカーのSchemaVersionを下で確認する。
     let key = match hkcu.open_subkey_with_flags(REGISTRY_PATH, KEY_READ) {
         Ok(key) => key,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
