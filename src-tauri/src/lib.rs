@@ -8,11 +8,31 @@ mod credentials;
 mod migration;
 mod registry_support;
 mod settings;
+mod version_policy;
 
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Err(error) = version_policy::register_current_version() {
+        registry_support::show_registry_error(
+            "アプリバージョンの登録",
+            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+            &error,
+        );
+    }
+    match version_policy::read_status() {
+        Ok(status) if status.minimum_not_met => {
+            registry_support::show_minimum_version_required();
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            // GPO値の読取り失敗で全利用者を起動不能にしない。
+            eprintln!("バージョン方針を読み込めないため通常起動します: {error}");
+        }
+    }
+
     // Windows通知はAUMIDの登録がないとAPI上は成功しても表示されないことがある。
     // ユーザー単位の登録なので管理者権限は不要。失敗を知らせた後も本体は起動する。
     if let Err(error) = registry_support::ensure_notification_registration() {

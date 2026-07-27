@@ -4,6 +4,7 @@ use super::{
     auth_flow::begin_portlet_load, downloads::cleanup_directory, settings_snapshot, AppState,
     APP_TITLE, MAIN_LABEL, SETTINGS_LABEL,
 };
+use crate::{registry_support, version_policy};
 use std::{
     sync::{atomic::Ordering, Arc},
     thread,
@@ -88,11 +89,14 @@ pub(super) fn build_window_menu(
         .separator()
         .text(format!("quit:{window_label}"), "アプリ終了")
         .build()?;
-    MenuBuilder::new(app)
+    let mut menu = MenuBuilder::new(app)
         .item(&app_menu)
         .text(format!("reload:{window_label}"), RELOAD_MENU_LABEL)
-        .text(format!("close:{window_label}"), CLOSE_MENU_LABEL)
-        .build()
+        .text(format!("close:{window_label}"), CLOSE_MENU_LABEL);
+    if version_policy::read_status().is_ok_and(|status| status.update_available) {
+        menu = menu.text(format!("update-available:{window_label}"), "更新あり");
+    }
+    menu.build()
 }
 
 /// タスクトレイのアイコンと、表示・終了メニューを作る。
@@ -184,6 +188,9 @@ pub(super) fn handle_window_menu(window: &tauri::Window, id: &str) {
                 state.quitting.store(true, Ordering::Relaxed);
             }
             app.exit(0);
+        }
+        "update-available" => {
+            registry_support::show_update_available();
         }
         _ => {}
     }

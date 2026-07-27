@@ -9,7 +9,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TASKMODAL,
+    MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+    MB_TASKMODAL,
 };
 use winreg::{
     enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE},
@@ -32,6 +33,10 @@ fn wide(value: &str) -> Vec<u16> {
 
 /// コンソールのないrelease版でも利用者にエラーを伝えられる共通MessageBox。
 fn show_error_message(message: &str) {
+    show_message(message, MB_ICONERROR);
+}
+
+fn show_message(message: &str, icon: u32) {
     let title = wide("CreateWebFlowChecker");
     let message = wide(message);
     // MessageBoxWは呼び出し中だけUTF-16配列を参照するため、ローカル変数の
@@ -41,9 +46,20 @@ fn show_error_message(message: &str) {
             std::ptr::null_mut(),
             message.as_ptr(),
             title.as_ptr(),
-            MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND,
+            MB_OK | icon | MB_TASKMODAL | MB_SETFOREGROUND,
         );
     }
+}
+
+pub fn show_update_available() {
+    show_message("新しいバージョンが配信されています", MB_ICONINFORMATION);
+}
+
+pub fn show_minimum_version_required() {
+    show_message(
+        "新しいバージョンが出ています。更新してください",
+        MB_ICONWARNING,
+    );
 }
 
 /// レジストリエラーの本文を一か所で組み立てる。
