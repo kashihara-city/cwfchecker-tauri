@@ -53,6 +53,13 @@ function Get-LockedCratesIoPackages {
         }
     }
 
+    if ($packages.Count -eq 0) {
+        throw (
+            "No crates.io packages were found in $lockPath. " +
+            "The lockfile format may have changed; cooldown was NOT verified."
+        )
+    }
+
     return $packages
 }
 
@@ -170,8 +177,10 @@ for ($attempt = 1; $attempt -le $maximumResolutionAttempts; $attempt++) {
 
     if (-not $Resolve) {
         throw (
-            "{0}@{1} has not been public for {2} full days. " +
-            "Run this script locally with -Resolve, review and commit Cargo.lock, then retry." -f
+            (
+                "{0}@{1} has not been public for {2} full days. " +
+                "Run this script locally with -Resolve, review and commit Cargo.lock, then retry."
+            ) -f
             $recentPackage.Name,
             $recentPackage.Version,
             $MinimumAgeDays
