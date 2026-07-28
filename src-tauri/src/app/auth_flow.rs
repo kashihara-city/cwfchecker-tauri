@@ -4,18 +4,15 @@
 //! 「どの更新要求か」を表す世代番号と組み合わせて状態を更新する。
 
 use super::{
-    build_portlet_endpoint, configured_origin, lock_error, settings_snapshot,
-    show_windows_notification, AppState, MAIN_LABEL, NOTIFICATION_TITLE,
+    build_portlet_endpoint, configured_origin, lock_error, show_windows_notification, AppState,
+    MAIN_LABEL, NOTIFICATION_TITLE,
 };
 use crate::{
     credentials::{self, Credential},
-    migration,
     settings::Settings,
 };
 use std::{
-    fs,
-    path::Path,
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -34,21 +31,6 @@ const SAML_POST_VALUE: &str = "SAML";
 const MAIN_WINDOW_LOGICAL_WIDTH: f64 = 600.0;
 const SCREEN_EDGE_RESERVE_LOGICAL_HEIGHT: f64 = 60.0;
 const CONTENT_HEIGHT_ROUNDING_MARGIN: f64 = 2.0;
-
-fn cleanup_legacy_config_if_pending(pending: &std::sync::atomic::AtomicBool, path: Option<&Path>) {
-    if !pending.swap(false, Ordering::AcqRel) {
-        return;
-    }
-    let Some(path) = path else {
-        pending.store(true, Ordering::Release);
-        return;
-    };
-    if let Err(error) = fs::remove_file(path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            pending.store(true, Ordering::Release);
-        }
-    }
-}
 
 /// どのポートレット再読込みが現在有効かを表す。
 ///
@@ -307,18 +289,18 @@ pub(super) fn portlet_post_script(
     bootstrap_url: &str,
     generation: usize,
 ) -> Result<String, String> {
-    let settings = settings_snapshot(state)?;
+    let settings = &state.settings;
     let stored = if settings.use_saml_auth {
         None
     } else {
         credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
     };
-    let credential = post_credential(&settings, stored)?;
+    let credential = post_credential(settings, stored)?;
 
     let config = serde_json::json!({
         "bootstrapUrl": bootstrap_url,
         "windowName": load_generation_window_name(generation),
-        "action": build_portlet_endpoint(&settings)?.as_str(),
+        "action": build_portlet_endpoint(settings)?.as_str(),
         "fields": [
             ["view", "recv"],
             ["loginid", credential.username.as_str()],
@@ -550,9 +532,8 @@ pub(super) fn process_page_report(
     let _ = window.set_position(PhysicalPosition::new(0, 0));
 
     if report.decision_count > 0 {
-        let settings = settings_snapshot(state)?;
         let visible = window.is_visible().unwrap_or(false);
-        if settings.notify_by_bar && !visible {
+        if state.settings.notify_by_bar && !visible {
             let body = format!("{} 件処理待ちです。", report.count_text);
             if let Err(error) = show_windows_notification(app, NOTIFICATION_TITLE, &body) {
                 eprintln!("Windows通知の表示に失敗しました: {error}");
@@ -562,58 +543,12 @@ pub(super) fn process_page_report(
             let _ = window.set_focus();
         }
     }
-    if report.auth_count > 0 {
-        // 認証成功の目印を同一オリジンのページで確認できた時点でのみ、
-        // 移行元JSONを一度だけ削除する。失敗時は次回認証で再試行する。
-        let path = migration::legacy_config_path();
-        cleanup_legacy_config_if_pending(&state.legacy_cleanup_pending, path.as_deref());
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        sync::atomic::AtomicBool,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    fn temporary_test_path(label: &str) -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("cwfchecker-{label}-{}-{nonce}", std::process::id()))
-    }
-
-    #[test]
-    fn removes_the_legacy_config_only_once() {
-        let path = temporary_test_path("cleanup-once");
-        fs::write(&path, b"legacy").expect("create legacy config");
-        let pending = AtomicBool::new(true);
-
-        cleanup_legacy_config_if_pending(&pending, Some(&path));
-        assert!(!path.exists());
-        assert!(!pending.load(Ordering::Acquire));
-
-        fs::write(&path, b"new file").expect("recreate file");
-        cleanup_legacy_config_if_pending(&pending, Some(&path));
-        assert!(path.exists());
-        fs::remove_file(path).expect("remove recreated file");
-    }
-
-    #[test]
-    fn retries_legacy_cleanup_after_a_delete_failure() {
-        let path = temporary_test_path("cleanup-retry");
-        fs::create_dir(&path).expect("create directory that remove_file cannot delete");
-        let pending = AtomicBool::new(true);
-
-        cleanup_legacy_config_if_pending(&pending, Some(&path));
-
-        assert!(pending.load(Ordering::Acquire));
-        fs::remove_dir(path).expect("remove test directory");
-    }
 
     #[test]
     fn parses_rendered_content_height() {

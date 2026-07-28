@@ -3,7 +3,6 @@
 //! パスワードはこのモジュールでは扱わず、`credentials`モジュールを通して
 //! Windows資格情報マネージャーへ保存する。
 
-use serde::{Deserialize, Serialize};
 use std::io;
 use winreg::{
     enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE},
@@ -25,14 +24,13 @@ pub const MAX_INTERVAL_MINUTES: u32 = 360;
 // 同じキーにあるAppVersion・LatestVersion・MinimumVersionはversion_policyの管理値。
 // 一般設定の保存失敗時にGPO値や実行版の記録を巻き戻さないため、ここには含めない。
 // UseSAMLAuthも管理者配布値なので、アプリの書込み・復元対象には含めない。
-const SETTINGS_VALUE_NAMES: [&str; 7] = [
+const WRITTEN_SETTING_VALUE_NAMES: [&str; 6] = [
     VALUE_AD_SERVER,
     VALUE_CWF_ADDRESS,
     VALUE_INTERVAL_MINUTES,
     VALUE_NOTIFY_BY_BAR,
     VALUE_SHORTCUT,
     VALUE_SCHEMA_VERSION,
-    LEGACY_MIGRATION_VALUE,
 ];
 
 /// アプリが変更する各値の、書き込み前の型とバイト列。
@@ -50,8 +48,7 @@ fn migration_version_completed(version: u32) -> bool {
 /// Rust内部と設定画面のJavaScriptで共有する、パスワード以外の設定。
 ///
 /// `rename_all`により、Rust側の`cwf_address`はJavaScript側で`cwfAddress`になる。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub ad_server: String,
     pub cwf_address: String,
@@ -118,10 +115,9 @@ impl Settings {
     }
 }
 
-/// 旧設定を既に永続化したかを、旧ファイルとは独立したマーカーで判定する。
+/// 旧設定の自動移行を既に試行したか、旧ファイルとは独立したマーカーで判定する。
 ///
-/// 旧ファイルはCWFでの認証成功まで残すため、ファイルの有無だけでは再起動時に
-/// 同じ移行を繰り返してしまう。
+/// 旧ファイルは削除しないため、ファイルの有無だけでは同じ移行を繰り返してしまう。
 pub fn legacy_migration_completed() -> io::Result<bool> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let key = match hkcu.open_subkey_with_flags(REGISTRY_PATH, KEY_READ) {
@@ -144,8 +140,8 @@ pub fn legacy_migration_completed() -> io::Result<bool> {
     }
 }
 
-/// 旧設定の永続化が完了した最後に、一度限りの移行マーカーを保存する。
-pub fn mark_legacy_migrated() -> io::Result<()> {
+/// 自動移行の直前に、成否を問わず再試行しないためのマーカーを保存する。
+pub fn mark_legacy_migration_completed() -> io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _) = hkcu.create_subkey_with_flags(REGISTRY_PATH, KEY_READ | KEY_WRITE)?;
     key.set_value(LEGACY_MIGRATION_VALUE, &LEGACY_MIGRATION_VERSION)?;
@@ -282,18 +278,24 @@ pub fn write_missing_saml_defaults(settings: &Settings) -> io::Result<bool> {
 }
 
 fn managed_values_equal(actual: &Settings, expected: &Settings) -> bool {
-    actual.ad_server == expected.ad_server
-        && actual.cwf_address == expected.cwf_address
-        && actual.interval_minutes == expected.interval_minutes
-        && actual.notify_by_bar == expected.notify_by_bar
-        && actual.shortcut == expected.shortcut
+    let mut expected = expected.clone();
+    expected.use_saml_auth = actual.use_saml_auth;
+    actual == &expected
 }
 
-/// 保存した値をレジストリから読み直し、アプリが書いた項目だけが一致するか調べる。
-pub fn verify(expected: &Settings) -> io::Result<bool> {
-    Ok(read()?
+/// 設定を書いた直後に、アプリが管理する値を読み戻して一致を確認する。
+pub fn write_verified(expected: &Settings) -> io::Result<()> {
+    write(expected)?;
+    if read()?
         .as_ref()
-        .is_some_and(|actual| managed_values_equal(actual, expected)))
+        .is_some_and(|actual| managed_values_equal(actual, expected))
+    {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "保存した設定と読み返した設定が一致しません。",
+        ))
+    }
 }
 
 /// 書き込み前の各値を、型も含めて読み取る。キーなしは全項目`None`として保持する。
@@ -304,8 +306,8 @@ fn snapshot_at(path: &str) -> io::Result<RegistrySnapshot> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    let mut values = Vec::with_capacity(SETTINGS_VALUE_NAMES.len());
-    for name in SETTINGS_VALUE_NAMES {
+    let mut values = Vec::with_capacity(WRITTEN_SETTING_VALUE_NAMES.len());
+    for name in WRITTEN_SETTING_VALUE_NAMES {
         let value = match key.as_ref().map(|key| key.get_raw_value(name)) {
             Some(Ok(value)) => Some(value),
             Some(Err(error)) if error.kind() == io::ErrorKind::NotFound => None,
@@ -362,7 +364,7 @@ mod tests {
     use super::{
         managed_values_equal, migration_version_completed, restore_snapshot_at, snapshot_at,
         write_at, write_missing_saml_defaults_at, Settings, MAX_INTERVAL_MINUTES,
-        SETTINGS_VALUE_NAMES,
+        WRITTEN_SETTING_VALUE_NAMES,
     };
     use std::time::SystemTime;
     use winreg::{
@@ -508,12 +510,12 @@ mod tests {
         let unmanaged: Vec<String> = key
             .enum_values()
             .map(|entry| entry.expect("enumerate written value").0)
-            .filter(|name| !SETTINGS_VALUE_NAMES.contains(&name.as_str()))
+            .filter(|name| !WRITTEN_SETTING_VALUE_NAMES.contains(&name.as_str()))
             .collect();
 
         assert!(
             unmanaged.is_empty(),
-            "write_at wrote values missing from SETTINGS_VALUE_NAMES: {unmanaged:?}"
+            "write_at wrote values missing from WRITTEN_SETTING_VALUE_NAMES: {unmanaged:?}"
         );
         drop(key);
         hkcu.delete_subkey_all(&path).expect("remove test key");

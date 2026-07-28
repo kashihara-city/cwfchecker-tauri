@@ -99,16 +99,6 @@ pub fn report_io<T>(operation: &str, path: &str, result: io::Result<T>) -> io::R
     })
 }
 
-/// 保存後の照合結果がfalseなら、通常のレジストリエラーと同じ形で報告する。
-pub fn require_verified(operation: &str, path: &str, verified: bool) -> io::Result<()> {
-    if verified {
-        return Ok(());
-    }
-    let error = io::Error::other("保存した設定と読み返した設定が一致しません。");
-    show_registry_error(operation, path, &error);
-    Err(error)
-}
-
 /// exe横に通知用ICOがあれば再利用し、なければ埋め込みデータを書き出す。
 ///
 /// ICOは通知の装飾なので、書き込み禁止フォルダーでもアプリを止めない。

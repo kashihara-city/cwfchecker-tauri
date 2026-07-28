@@ -89,6 +89,11 @@ pub fn normalize_id(id: &str, allow_empty: bool) -> Result<Option<String>, Strin
     }
 }
 
+/// 外部から作成された不正なIDは利用せず、設定画面で再入力できる空IDへ倒す。
+fn normalize_stored_id(id: &str) -> String {
+    normalize_id(id, true).ok().flatten().unwrap_or_default()
+}
+
 /// Windows API用のNUL終端UTF-16文字列へ変換する。
 ///
 /// 途中にNULがある文字列を許すと、Windows側ではそこで文字列が切れて別の
@@ -173,9 +178,7 @@ pub fn read(target: &str) -> io::Result<Option<Credential>> {
         // 先に`?`を書くと、エラー時にWindowsが確保したpointerを解放できない。
         let password = decode_password_blob(bytes);
         CredFree(pointer.cast::<c_void>());
-        let username = normalize_id(&username, true)
-            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?
-            .unwrap_or_default();
+        let username = normalize_stored_id(&username);
         Credential {
             username,
             password: password?,
@@ -541,7 +544,7 @@ pub fn decrypt_electron_safe_storage(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_password_blob, decrypt_aes_gcm, wide_null};
+    use super::{decode_password_blob, decrypt_aes_gcm, normalize_stored_id, wide_null};
 
     #[test]
     fn accepts_only_utf8_password_blobs() {
@@ -556,6 +559,12 @@ mod tests {
     fn rejects_embedded_nul_in_windows_strings() {
         assert!(wide_null("safe").is_ok());
         assert!(wide_null("unsafe\0suffix").is_err());
+    }
+
+    #[test]
+    fn treats_an_invalid_stored_id_as_empty() {
+        assert_eq!(normalize_stored_id("  USER  "), "USER");
+        assert_eq!(normalize_stored_id("USER\u{0007}"), "");
     }
 
     #[test]

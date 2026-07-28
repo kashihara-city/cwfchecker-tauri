@@ -84,7 +84,7 @@ HKEY_CURRENT_USER\Software\KashiharaCity\CwfChecker
 | `NotifyByBar`            | ポップアップせず通知バーでお知らせ | 案件発見時にメイン画面ではなくWindows通知を表示 | 初期値OFF             |
 | `Shortcut`               | ショートカットキー                 | 表示・非表示を切り替えるキー                    | 初期値`F3`            |
 | `SchemaVersion`          | ―                                  | 設定形式のバージョン                            | アプリが自動設定      |
-| `LegacyMigrationVersion` | ―                                  | 旧設定を一度だけ移行したことを示すマーカー      | 移行時に自動設定      |
+| `LegacyMigrationVersion` | ―                                  | 旧設定の自動移行を一度だけ試したことを示すマーカー | 移行前に自動設定   |
 | `AppVersion`             | ―                                  | 起動したアプリ自身のバージョン                  | 起動時に自動設定      |
 
 複数キーのショートカットは`SHIFT+F2`のように、修飾キーとキーを`+`で区切ります。
@@ -169,11 +169,10 @@ Tauri版の配布前にGPOで設定を管理する場合は、主に次の項目
   Windows DPAPIとAES-256-GCMで認証付き復号
 - ID/PWをWindows資格情報マネージャーの`KashiharaCity.CwfChecker`へ保存
 - 書き込み後に通常設定と資格情報を読み返して確認
-- `LegacyMigrationVersion=1`を最後に保存し、認証前に再起動しても再移行しない
+- 移行を試す前に`LegacyMigrationVersion=1`を保存し、成否を問わず再移行しない
 
-移行直後には旧ファイルを削除しません。Create!Webフローのページで認証成功を確認した後、
-旧`config.json`を削除します。削除に失敗した場合は次回の認証成功時に再試行します。
-旧設定が壊れていても有効なRust版設定があれば、警告を表示して現在の設定で起動を続けます。
+旧`config.json`は移行後も削除しません。
+旧設定を移行できなかった場合は警告を表示し、有効なRust版設定または既定値で起動を続けます。
 
 ## フッター画像
 

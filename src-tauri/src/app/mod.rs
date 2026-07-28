@@ -24,7 +24,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize},
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -53,15 +53,14 @@ fn show_windows_notification(app: &AppHandle, title: &str, body: &str) -> Result
 
 /// 複数のコールバックやタイマースレッドから共有するアプリの状態。
 ///
-/// `RwLock`は設定の読み書きを、`Mutex`は複数の値をまとめて更新する処理を、
-/// `Atomic*`は単純なフラグや件数を、それぞれスレッド間で安全に共有する。
+/// `Mutex`は複数の値をまとめて更新する処理を、`Atomic*`は単純なフラグや件数を、
+/// それぞれスレッド間で安全に共有する。設定変更後は再起動するため、設定自体は不変。
 pub struct AppState {
-    settings: RwLock<Settings>,
+    settings: Settings,
     cache_root: PathBuf,
     download_dir: PathBuf,
     quitting: AtomicBool,
     settings_opening: AtomicBool,
-    legacy_cleanup_pending: AtomicBool,
     /// 複数スレッドからのnavigate要求順と世代番号の更新順を一致させる。
     ///
     /// `window.navigate()`はコールバックを呼ぶ可能性があるため、コールバックも使う
@@ -106,14 +105,6 @@ fn lock_error() -> String {
     "アプリの共有状態のロックに失敗しました。".to_owned()
 }
 
-fn settings_snapshot(state: &AppState) -> Result<Settings, String> {
-    state
-        .settings
-        .read()
-        .map(|value| value.clone())
-        .map_err(|_| lock_error())
-}
-
 /// `withGlobalTauri`はリモートのCWF画面にもIPCブリッジを公開する。
 ///
 /// capabilityだけでなく、すべてのTauriコマンドでこの検査を行い、
@@ -136,12 +127,12 @@ fn build_portlet_endpoint(settings: &Settings) -> Result<Url, String> {
 }
 
 fn configured_url(state: &AppState) -> Result<Option<Url>, String> {
-    let settings = settings_snapshot(state)?;
+    let settings = &state.settings;
     if settings.cwf_address.is_empty() {
         return Ok(None);
     }
     if settings.use_saml_auth {
-        return build_portlet_endpoint(&settings).map(Some);
+        return build_portlet_endpoint(settings).map(Some);
     }
     let Some(credential) =
         credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
@@ -153,11 +144,11 @@ fn configured_url(state: &AppState) -> Result<Option<Url>, String> {
     {
         return Ok(None);
     }
-    build_portlet_endpoint(&settings).map(Some)
+    build_portlet_endpoint(settings).map(Some)
 }
 
 fn configured_origin(state: &AppState) -> Result<Option<String>, String> {
-    let settings = settings_snapshot(state)?;
+    let settings = &state.settings;
     if settings.cwf_address.is_empty() {
         return Ok(None);
     }
@@ -180,18 +171,18 @@ pub fn get_settings(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<SettingsView, String> {
     ensure_settings_window(&window)?;
-    let settings = settings_snapshot(&state)?;
+    let settings = &state.settings;
     let id = credentials::read(credentials::TARGET)
         .map_err(|error| error.to_string())?
         .map(|credential| credential.username)
         .unwrap_or_default();
     Ok(SettingsView {
         id,
-        ad_server: settings.ad_server,
-        cwf_address: settings.cwf_address,
+        ad_server: settings.ad_server.clone(),
+        cwf_address: settings.cwf_address.clone(),
         interval_minutes: settings.interval_minutes,
         notify_by_bar: settings.notify_by_bar,
-        shortcut: settings.shortcut,
+        shortcut: settings.shortcut.clone(),
         version: CURRENT_VERSION,
     })
 }
@@ -205,7 +196,7 @@ pub fn save_settings(
     input: SettingsInput,
 ) -> Result<(), String> {
     ensure_settings_window(&window)?;
-    let use_saml_auth = settings_snapshot(&state)?.use_saml_auth;
+    let use_saml_auth = state.settings.use_saml_auth;
     let id = credentials::normalize_id(&input.id, use_saml_auth)?;
     let settings = Settings {
         ad_server: input.ad_server,
@@ -279,27 +270,12 @@ pub fn save_settings(
         true
     };
 
-    let registry_result = (|| -> Result<(), String> {
-        // 小さなクロージャーにすることで、途中の`?`をまとめて1個のResultとして扱う。
-        registry_support::report_io(
-            "アプリ設定の保存",
-            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            settings::write(&settings),
-        )
-        .map_err(|error| error.to_string())?;
-        let verified = registry_support::report_io(
-            "アプリ設定の保存後確認",
-            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            settings::verify(&settings),
-        )
-        .map_err(|error| error.to_string())?;
-        registry_support::require_verified(
-            "アプリ設定の保存後確認",
-            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            verified,
-        )
-        .map_err(|error| error.to_string())
-    })();
+    let registry_result = registry_support::report_io(
+        "アプリ設定の保存と確認",
+        registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+        settings::write_verified(&settings),
+    )
+    .map_err(|error| error.to_string());
     if let Err(error) = registry_result {
         // 資格情報とレジストリは別の保存先なので、片方の復元に失敗しても
         // もう片方の復元は必ず試す。これが完全なトランザクションの代わりになる。
@@ -329,9 +305,6 @@ pub fn save_settings(
         }
         return Err(message);
     }
-    // 両方の永続化に成功してから、実行中アプリが参照する値を切り替える。
-    *state.settings.write().map_err(|_| lock_error())? = settings;
-
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(500));
         app.restart();
@@ -343,8 +316,7 @@ pub fn save_settings(
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let cache_root = prepare_cache()?;
     let download_dir = app.path().document_dir()?.join("cwf_downloads");
-    let loaded = migration::load_or_migrate()?;
-    let settings = loaded.settings;
+    let settings = migration::load_or_migrate()?;
     if let Err(error) = registry_support::report_io(
         "SAML既定設定の保存",
         registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
@@ -353,12 +325,11 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("SAML既定設定を保存できませんでした: {error}");
     }
     let state = Arc::new(AppState {
-        settings: RwLock::new(settings),
+        settings,
         cache_root,
         download_dir,
         quitting: AtomicBool::new(false),
         settings_opening: AtomicBool::new(false),
-        legacy_cleanup_pending: AtomicBool::new(loaded.legacy_cleanup_pending),
         portlet_navigation: Mutex::new(()),
         // 最初のローカル起動ページは世代1としてWebView生成時に指定している。
         portlet_load: Mutex::new(PortletLoadState::initial()),
@@ -370,9 +341,7 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(state.clone());
 
     create_tray(app.handle())?;
-    let shortcut_text = settings_snapshot(&state)
-        .map(|settings| settings.shortcut)
-        .unwrap_or_else(|_| "F3".to_owned());
+    let shortcut_text = state.settings.shortcut.clone();
     if let Ok(shortcut) = shortcut_text.parse::<tauri_plugin_global_shortcut::Shortcut>() {
         let _ = app.global_shortcut().register(shortcut);
     }

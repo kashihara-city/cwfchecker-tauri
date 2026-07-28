@@ -1,8 +1,8 @@
 //! ウィンドウ、メニュー、タスクトレイ、定期更新の操作をまとめる。
 
 use super::{
-    auth_flow::begin_portlet_load, downloads::cleanup_directory, settings_snapshot, AppState,
-    APP_TITLE, MAIN_LABEL, SETTINGS_LABEL,
+    auth_flow::begin_portlet_load, downloads::cleanup_directory, AppState, APP_TITLE, MAIN_LABEL,
+    SETTINGS_LABEL,
 };
 use crate::{registry_support, version_policy};
 use std::{
@@ -140,10 +140,7 @@ pub(super) fn start_timer(app: AppHandle, state: Arc<AppState>) {
     // 専用スレッドは最小15分眠り、案件画面や設定画面を操作中でない場合だけ更新する。
     // UI操作そのものはTauriのスレッドセーフなAppHandle経由で依頼する。
     thread::spawn(move || loop {
-        let minutes = settings_snapshot(&state)
-            .map(|settings| settings.interval_minutes)
-            .unwrap_or(15)
-            .max(15);
+        let minutes = state.settings.interval_minutes.max(15);
         thread::sleep(Duration::from_secs(minutes as u64 * 60));
         if state.quitting.load(Ordering::Relaxed)
             || state.decisions.load(Ordering::Relaxed) > 0

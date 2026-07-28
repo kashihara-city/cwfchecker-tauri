@@ -1,7 +1,7 @@
 //! 旧Electron版の設定を、Rust版の保存形式へ一度だけ移行する。
 //!
 //! Rust版の有効な設定を壊さない範囲で、未移行の旧設定を一度だけ取り込む。
-//! 旧ファイルと旧資格情報の削除は、実際の認証成功を確認した後に`app`側で行う。
+//! 移行元JSONは削除せず、移行の成否にかかわらず二度目の自動移行は行わない。
 
 use crate::{
     credentials, registry_support,
@@ -14,12 +14,6 @@ use std::{
 };
 
 const MAX_LEGACY_CONFIG_SIZE: u64 = 1024 * 1024;
-
-pub struct LoadedSettings {
-    pub settings: Settings,
-    /// 移行元JSONを、CWFへの認証成功後に削除する必要がある。
-    pub legacy_cleanup_pending: bool,
-}
 
 /// Electron版のconfig.jsonで使用されていたフィールド名。
 ///
@@ -157,13 +151,10 @@ fn decrypt_legacy_password(path: &Path, encrypted: &str) -> Option<String> {
 fn resolve_migration(
     existing: Option<Settings>,
     migrated: io::Result<Settings>,
-) -> io::Result<(Settings, Option<io::Error>)> {
+) -> (Settings, Option<io::Error>) {
     match migrated {
-        Ok(settings) => Ok((settings, None)),
-        Err(error) => match existing {
-            Some(settings) => Ok((settings, Some(error))),
-            None => Err(error),
-        },
+        Ok(settings) => (settings, None),
+        Err(error) => (existing.unwrap_or_default(), Some(error)),
     }
 }
 
@@ -214,28 +205,11 @@ fn migrate_legacy(path: &Path, existing: Option<&Settings>) -> io::Result<Settin
         }
     }
 
-    let registry_result = (|| -> io::Result<()> {
-        registry_support::report_io(
-            "旧Electron版設定の移行",
-            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            settings::write(&migrated),
-        )?;
-        let verified = registry_support::report_io(
-            "移行した設定の保存後確認",
-            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            settings::verify(&migrated),
-        )?;
-        registry_support::require_verified(
-            "移行した設定の保存後確認",
-            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            verified,
-        )?;
-        registry_support::report_io(
-            "旧設定の移行済みマーカーの保存",
-            registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
-            settings::mark_legacy_migrated(),
-        )
-    })();
+    let registry_result = registry_support::report_io(
+        "旧Electron版設定の保存と確認",
+        registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+        settings::write_verified(&migrated),
+    );
     if let Err(error) = registry_result {
         // 2個の復元は先に両方実行し、一方の失敗で他方を試さない状態を避ける。
         let registry_rollback = settings::restore_snapshot(&registry_snapshot);
@@ -247,13 +221,11 @@ fn migrate_legacy(path: &Path, existing: Option<&Settings>) -> io::Result<Settin
         ));
     }
 
-    // 読み返しで分かるのは保存データの一致まで。旧JSONと旧資格情報は、
-    // Create!Webフロー側で認証成功を確認するまで残す。
     Ok(migrated)
 }
 
 /// 現行設定を読み、未移行の旧Electron版設定があれば安全な範囲で取り込む。
-pub fn load_or_migrate() -> io::Result<LoadedSettings> {
+pub fn load_or_migrate() -> io::Result<Settings> {
     let existing_result = registry_support::report_io(
         "アプリ設定の読み込み",
         registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
@@ -271,28 +243,26 @@ pub fn load_or_migrate() -> io::Result<LoadedSettings> {
         settings::legacy_migration_completed(),
     )?;
     if migration_completed {
-        return Ok(LoadedSettings {
-            settings: existing.unwrap_or_default(),
-            legacy_cleanup_pending: legacy_config_path().is_some_and(|path| path.is_file()),
-        });
+        return Ok(existing.unwrap_or_default());
     }
 
     let Some(path) = legacy_config_path().filter(|path| path.is_file()) else {
-        return Ok(LoadedSettings {
-            settings: existing.unwrap_or_default(),
-            legacy_cleanup_pending: false,
-        });
+        return Ok(existing.unwrap_or_default());
     };
+
+    // 自動移行は成否を問わず一度だけにする。先にマーカーを確定することで、
+    // 壊れた旧JSONによる起動ごとの再試行を防ぐ。旧JSON自体は削除しない。
+    registry_support::report_io(
+        "旧設定の移行済みマーカーの保存",
+        registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+        settings::mark_legacy_migration_completed(),
+    )?;
     let (settings, warning) =
-        resolve_migration(existing.clone(), migrate_legacy(&path, existing.as_ref()))?;
-    let legacy_cleanup_pending = warning.is_none();
+        resolve_migration(existing.clone(), migrate_legacy(&path, existing.as_ref()));
     if let Some(error) = warning {
         registry_support::show_migration_warning(&error);
     }
-    Ok(LoadedSettings {
-        settings,
-        legacy_cleanup_pending,
-    })
+    Ok(settings)
 }
 
 #[cfg(test)]
@@ -343,25 +313,24 @@ mod tests {
                 io::ErrorKind::InvalidData,
                 "broken legacy JSON",
             )),
-        )
-        .expect("fall back to existing settings");
+        );
 
         assert_eq!(resolved, existing);
         assert_eq!(warning.expect("warning").kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
-    fn fails_when_legacy_migration_fails_without_existing_settings() {
-        let error = resolve_migration(
+    fn uses_default_settings_when_legacy_migration_fails_without_existing_settings() {
+        let (resolved, warning) = resolve_migration(
             None,
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "broken legacy JSON",
             )),
-        )
-        .expect_err("no settings to fall back to");
+        );
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(resolved, Settings::default());
+        assert_eq!(warning.expect("warning").kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
