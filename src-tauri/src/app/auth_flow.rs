@@ -14,7 +14,8 @@ use crate::{
 };
 use std::{
     fs,
-    sync::Arc,
+    path::Path,
+    sync::{atomic::Ordering, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -33,6 +34,21 @@ const SAML_POST_VALUE: &str = "SAML";
 const MAIN_WINDOW_LOGICAL_WIDTH: f64 = 600.0;
 const SCREEN_EDGE_RESERVE_LOGICAL_HEIGHT: f64 = 60.0;
 const CONTENT_HEIGHT_ROUNDING_MARGIN: f64 = 2.0;
+
+fn cleanup_legacy_config_if_pending(pending: &std::sync::atomic::AtomicBool, path: Option<&Path>) {
+    if !pending.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let Some(path) = path else {
+        pending.store(true, Ordering::Release);
+        return;
+    };
+    if let Err(error) = fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            pending.store(true, Ordering::Release);
+        }
+    }
+}
 
 /// どのポートレット再読込みが現在有効かを表す。
 ///
@@ -548,13 +564,9 @@ pub(super) fn process_page_report(
     }
     if report.auth_count > 0 {
         // 認証成功の目印を同一オリジンのページで確認できた時点でのみ、
-        // 移行元を削除する。単なる書き込み後照合だけでは削除しない。
-        if let Ok(Some(current)) = credentials::read(credentials::TARGET) {
-            let _ = credentials::delete(&credentials::legacy_target(&current.username));
-        }
-        if let Some(path) = migration::legacy_config_path() {
-            let _ = fs::remove_file(path);
-        }
+        // 移行元JSONを一度だけ削除する。失敗時は次回認証で再試行する。
+        let path = migration::legacy_config_path();
+        cleanup_legacy_config_if_pending(&state.legacy_cleanup_pending, path.as_deref());
     }
     Ok(())
 }
@@ -562,6 +574,46 @@ pub(super) fn process_page_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::atomic::AtomicBool,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temporary_test_path(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("cwfchecker-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn removes_the_legacy_config_only_once() {
+        let path = temporary_test_path("cleanup-once");
+        fs::write(&path, b"legacy").expect("create legacy config");
+        let pending = AtomicBool::new(true);
+
+        cleanup_legacy_config_if_pending(&pending, Some(&path));
+        assert!(!path.exists());
+        assert!(!pending.load(Ordering::Acquire));
+
+        fs::write(&path, b"new file").expect("recreate file");
+        cleanup_legacy_config_if_pending(&pending, Some(&path));
+        assert!(path.exists());
+        fs::remove_file(path).expect("remove recreated file");
+    }
+
+    #[test]
+    fn retries_legacy_cleanup_after_a_delete_failure() {
+        let path = temporary_test_path("cleanup-retry");
+        fs::create_dir(&path).expect("create directory that remove_file cannot delete");
+        let pending = AtomicBool::new(true);
+
+        cleanup_legacy_config_if_pending(&pending, Some(&path));
+
+        assert!(pending.load(Ordering::Acquire));
+        fs::remove_dir(path).expect("remove test directory");
+    }
 
     #[test]
     fn parses_rendered_content_height() {

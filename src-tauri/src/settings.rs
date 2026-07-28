@@ -281,9 +281,19 @@ pub fn write_missing_saml_defaults(settings: &Settings) -> io::Result<bool> {
     write_missing_saml_defaults_at(REGISTRY_PATH, settings)
 }
 
-/// 保存した値をレジストリから読み直し、期待値と完全に一致するか調べる。
+fn managed_values_equal(actual: &Settings, expected: &Settings) -> bool {
+    actual.ad_server == expected.ad_server
+        && actual.cwf_address == expected.cwf_address
+        && actual.interval_minutes == expected.interval_minutes
+        && actual.notify_by_bar == expected.notify_by_bar
+        && actual.shortcut == expected.shortcut
+}
+
+/// 保存した値をレジストリから読み直し、アプリが書いた項目だけが一致するか調べる。
 pub fn verify(expected: &Settings) -> io::Result<bool> {
-    Ok(read()?.as_ref() == Some(expected))
+    Ok(read()?
+        .as_ref()
+        .is_some_and(|actual| managed_values_equal(actual, expected)))
 }
 
 /// 書き込み前の各値を、型も含めて読み取る。キーなしは全項目`None`として保持する。
@@ -350,8 +360,9 @@ pub fn restore_snapshot(snapshot: &RegistrySnapshot) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        migration_version_completed, restore_snapshot_at, snapshot_at, write_at,
-        write_missing_saml_defaults_at, Settings, MAX_INTERVAL_MINUTES, SETTINGS_VALUE_NAMES,
+        managed_values_equal, migration_version_completed, restore_snapshot_at, snapshot_at,
+        write_at, write_missing_saml_defaults_at, Settings, MAX_INTERVAL_MINUTES,
+        SETTINGS_VALUE_NAMES,
     };
     use std::time::SystemTime;
     use winreg::{
@@ -441,6 +452,28 @@ mod tests {
     #[test]
     fn defaults_to_normal_authentication() {
         assert!(!Settings::default().use_saml_auth);
+    }
+
+    #[test]
+    fn verification_ignores_the_administrator_managed_saml_flag() {
+        let expected = Settings::default();
+        let actual = Settings {
+            use_saml_auth: true,
+            ..expected.clone()
+        };
+
+        assert!(managed_values_equal(&actual, &expected));
+    }
+
+    #[test]
+    fn verification_detects_a_mismatch_in_an_app_managed_value() {
+        let expected = Settings::default();
+        let actual = Settings {
+            shortcut: "F4".to_owned(),
+            ..expected.clone()
+        };
+
+        assert!(!managed_values_equal(&actual, &expected));
     }
 
     #[test]

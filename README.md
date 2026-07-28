@@ -162,8 +162,9 @@ Tauri版の配布前にGPOで設定を管理する場合は、主に次の項目
 - 旧設定側で空または欠落している項目は、完成済みのRust版設定があれば維持
 - Rust版に有効なCWFAddressが既にあれば維持し、なければ旧CWFAddressを移行
 - 同じIDの現行資格情報があれば最優先で維持
-- 現行資格情報がなければElectron `safeStorage`の`encpw`、次に
-  旧旧keytar資格情報`cwfchecker/<ID>`の順でPWを移行
+- 同じIDの現行資格情報がなければElectron `safeStorage`の`encpw`を復号して移行
+- `encpw`を復号できない場合はPWなしとして移行を続け、必要に応じて再入力
+- 別IDの現行資格情報がある場合、復号できなかった旧PWでは上書きしない
 - Electronの`v10`/`v11`形式では同じフォルダーの`Local State`から暗号鍵を読み、
   Windows DPAPIとAES-256-GCMで認証付き復号
 - ID/PWをWindows資格情報マネージャーの`KashiharaCity.CwfChecker`へ保存
@@ -171,7 +172,7 @@ Tauri版の配布前にGPOで設定を管理する場合は、主に次の項目
 - `LegacyMigrationVersion=1`を最後に保存し、認証前に再起動しても再移行しない
 
 移行直後には旧ファイルを削除しません。Create!Webフローのページで認証成功を確認した後、
-旧`config.json`と旧旧keytar資格情報を削除します。
+旧`config.json`を削除します。削除に失敗した場合は次回の認証成功時に再試行します。
 旧設定が壊れていても有効なRust版設定があれば、警告を表示して現在の設定で起動を続けます。
 
 ## フッター画像

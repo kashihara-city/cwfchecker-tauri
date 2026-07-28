@@ -72,6 +72,23 @@ pub struct Credential {
     pub password: String,
 }
 
+/// 資格情報のIDを正規化し、保存や利用に適さない制御文字を拒否する。
+pub fn normalize_id(id: &str, allow_empty: bool) -> Result<Option<String>, String> {
+    if id.chars().any(char::is_control) {
+        return Err("IDには制御文字を含めないでください。".to_owned());
+    }
+    let id = id.trim();
+    if id.is_empty() {
+        if allow_empty {
+            Ok(None)
+        } else {
+            Err("IDを入力してください。".to_owned())
+        }
+    } else {
+        Ok(Some(id.to_owned()))
+    }
+}
+
 /// Windows API用のNUL終端UTF-16文字列へ変換する。
 ///
 /// 途中にNULがある文字列を許すと、Windows側ではそこで文字列が切れて別の
@@ -90,7 +107,7 @@ fn win_error() -> io::Error {
     io::Error::last_os_error()
 }
 
-/// 現行Rust版と旧keytar版が保存したUTF-8のCredentialBlobだけを受け入れる。
+/// 現行Rust版が保存したUTF-8のCredentialBlobだけを受け入れる。
 fn decode_password_blob(bytes: &[u8]) -> io::Result<String> {
     String::from_utf8(bytes.to_vec()).map_err(|error| {
         io::Error::new(
@@ -156,6 +173,9 @@ pub fn read(target: &str) -> io::Result<Option<Credential>> {
         // 先に`?`を書くと、エラー時にWindowsが確保したpointerを解放できない。
         let password = decode_password_blob(bytes);
         CredFree(pointer.cast::<c_void>());
+        let username = normalize_id(&username, true)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?
+            .unwrap_or_default();
         Credential {
             username,
             password: password?,
@@ -241,10 +261,6 @@ pub fn restore(previous: Option<&Credential>) -> io::Result<()> {
         Some(credential) => write(TARGET, &credential.username, &credential.password),
         None => delete(TARGET),
     }
-}
-
-pub fn legacy_target(id: &str) -> String {
-    format!("cwfchecker/{id}")
 }
 
 fn cng_result(operation: &str, status: i32) -> io::Result<()> {

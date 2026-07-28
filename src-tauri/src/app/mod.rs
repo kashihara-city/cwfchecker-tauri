@@ -61,6 +61,7 @@ pub struct AppState {
     download_dir: PathBuf,
     quitting: AtomicBool,
     settings_opening: AtomicBool,
+    legacy_cleanup_pending: AtomicBool,
     /// 複数スレッドからのnavigate要求順と世代番号の更新順を一致させる。
     ///
     /// `window.navigate()`はコールバックを呼ぶ可能性があるため、コールバックも使う
@@ -111,22 +112,6 @@ fn settings_snapshot(state: &AppState) -> Result<Settings, String> {
         .read()
         .map(|value| value.clone())
         .map_err(|_| lock_error())
-}
-
-fn normalize_id(id: String, allow_empty: bool) -> Result<Option<String>, String> {
-    if id.chars().any(char::is_control) {
-        return Err("IDには制御文字を含めないでください。".to_owned());
-    }
-    let id = id.trim().to_owned();
-    if id.is_empty() {
-        if allow_empty {
-            Ok(None)
-        } else {
-            Err("IDを入力してください。".to_owned())
-        }
-    } else {
-        Ok(Some(id))
-    }
 }
 
 /// `withGlobalTauri`はリモートのCWF画面にもIPCブリッジを公開する。
@@ -221,7 +206,7 @@ pub fn save_settings(
 ) -> Result<(), String> {
     ensure_settings_window(&window)?;
     let use_saml_auth = settings_snapshot(&state)?.use_saml_auth;
-    let id = normalize_id(input.id, use_saml_auth)?;
+    let id = credentials::normalize_id(&input.id, use_saml_auth)?;
     let settings = Settings {
         ad_server: input.ad_server,
         cwf_address: input.cwf_address,
@@ -360,17 +345,20 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let download_dir = app.path().document_dir()?.join("cwf_downloads");
     let loaded = migration::load_or_migrate()?;
     let settings = loaded.settings;
-    registry_support::report_io(
+    if let Err(error) = registry_support::report_io(
         "SAML既定設定の保存",
         registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
         settings::write_missing_saml_defaults(&settings),
-    )?;
+    ) {
+        eprintln!("SAML既定設定を保存できませんでした: {error}");
+    }
     let state = Arc::new(AppState {
         settings: RwLock::new(settings),
         cache_root,
         download_dir,
         quitting: AtomicBool::new(false),
         settings_opening: AtomicBool::new(false),
+        legacy_cleanup_pending: AtomicBool::new(loaded.legacy_cleanup_pending),
         portlet_navigation: Mutex::new(()),
         // 最初のローカル起動ページは世代1としてWebView生成時に指定している。
         portlet_load: Mutex::new(PortletLoadState::initial()),
@@ -399,11 +387,8 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_portlet_endpoint, has_allowed_origin, normalize_id, CURRENT_VERSION,
-        NOTIFICATION_TITLE,
-    };
-    use crate::settings::Settings;
+    use super::{build_portlet_endpoint, has_allowed_origin, CURRENT_VERSION, NOTIFICATION_TITLE};
+    use crate::{credentials, settings::Settings};
     use url::Url;
 
     #[test]
@@ -426,17 +411,17 @@ mod tests {
     #[test]
     fn normalizes_and_validates_credential_ids() {
         assert_eq!(
-            normalize_id("  USER  ".to_owned(), false).expect("ID"),
+            credentials::normalize_id("  USER  ", false).expect("ID"),
             Some("USER".to_owned())
         );
-        assert!(normalize_id("  ".to_owned(), false)
+        assert!(credentials::normalize_id("  ", false)
             .unwrap_err()
             .contains("ID"));
         assert_eq!(
-            normalize_id("  ".to_owned(), true).expect("optional SAML ID"),
+            credentials::normalize_id("  ", true).expect("optional SAML ID"),
             None
         );
-        assert!(normalize_id("USER\u{0007}".to_owned(), true)
+        assert!(credentials::normalize_id("USER\u{0007}", true)
             .unwrap_err()
             .contains("制御文字"));
     }

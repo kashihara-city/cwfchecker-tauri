@@ -17,6 +17,8 @@ const MAX_LEGACY_CONFIG_SIZE: u64 = 1024 * 1024;
 
 pub struct LoadedSettings {
     pub settings: Settings,
+    /// 移行元JSONを、CWFへの認証成功後に削除する必要がある。
+    pub legacy_cleanup_pending: bool,
 }
 
 /// Electron版のconfig.jsonで使用されていたフィールド名。
@@ -122,13 +124,34 @@ fn merged_legacy_settings(
     .normalize()
 }
 
-/// 同じIDについて複数世代のPWが残っている場合の優先順位を一か所に固定する。
-fn preferred_password(
-    current: Option<String>,
-    encrypted_json: Option<String>,
-    legacy_keytar: Option<String>,
-) -> Option<String> {
-    current.or(encrypted_json).or(legacy_keytar)
+/// 移行元から現行資格情報を更新すべき場合だけ、書き込む内容を返す。
+///
+/// 復号できないPWのために、別IDの有効な資格情報を空PWで上書きしない。
+fn credential_update(
+    current: Option<&credentials::Credential>,
+    legacy_id: Option<String>,
+    decrypted_password: Option<String>,
+) -> Option<credentials::Credential> {
+    let legacy_id = legacy_id?;
+    if current.is_some_and(|credential| credential.username == legacy_id) {
+        return None;
+    }
+    match decrypted_password {
+        Some(password) => Some(credentials::Credential {
+            username: legacy_id,
+            password,
+        }),
+        None if current.is_none() => Some(credentials::Credential {
+            username: legacy_id,
+            password: String::new(),
+        }),
+        None => None,
+    }
+}
+
+fn decrypt_legacy_password(path: &Path, encrypted: &str) -> Option<String> {
+    let local_state = path.parent()?.join("Local State");
+    credentials::decrypt_electron_safe_storage(encrypted, &local_state).ok()
 }
 
 fn resolve_migration(
@@ -156,69 +179,30 @@ fn migrate_legacy(path: &Path, existing: Option<&Settings>) -> io::Result<Settin
     let migrated = merged_legacy_settings(&legacy, existing)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
 
-    // ID/PWは一組で現行資格情報へ移す。同じIDの現行PWを最優先し、なければ
-    // safeStorage、旧keytarの順に試す。PWがなくてもIDは空PWとともに保持し、
-    // 通常認証なら設定画面でPW入力を求められる状態にする。
+    // ID/PWは一組で現行資格情報へ移す。同じIDの現行PWは維持し、なければ
+    // safeStorageを試す。復号できなくても設定移行は続け、必要なら設定画面で
+    // PWの再入力を求められる状態にする。
     let current = credentials::read(credentials::TARGET)?;
-    let legacy_id = legacy.id.trim();
-    let credential_id = if legacy_id.is_empty() {
-        current
-            .as_ref()
-            .map(|credential| credential.username.trim().to_owned())
-            .unwrap_or_default()
-    } else {
-        legacy_id.to_owned()
-    };
-    let current_password = current
-        .as_ref()
-        .filter(|credential| credential.username == credential_id)
-        .map(|credential| credential.password.clone());
-    let encrypted_password = if !credential_id.is_empty() && current_password.is_none() {
+    let legacy_id = credentials::normalize_id(&legacy.id, true)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+    let encrypted_password = if legacy_id.is_some()
+        && !current.as_ref().is_some_and(|credential| {
+            legacy_id
+                .as_deref()
+                .is_some_and(|id| credential.username == id)
+        }) {
         legacy
             .encpw
             .as_deref()
-            .map(|value| {
-                let local_state = path
-                    .parent()
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "旧Electron版設定の親フォルダーを取得できません。",
-                        )
-                    })?
-                    .join("Local State");
-                credentials::decrypt_electron_safe_storage(value, &local_state)
-            })
-            .transpose()?
+            .and_then(|value| decrypt_legacy_password(path, value))
     } else {
         None
     };
-    let legacy_password = if !credential_id.is_empty()
-        && current_password.is_none()
-        && encrypted_password.is_none()
-    {
-        credentials::read(&credentials::legacy_target(&credential_id))?
-            .map(|credential| credential.password)
-    } else {
-        None
-    };
-    let password = preferred_password(
-        current_password.clone(),
-        encrypted_password,
-        legacy_password,
-    )
-    .unwrap_or_default();
-    let desired_credential = (!credential_id.is_empty()).then_some(credentials::Credential {
-        username: credential_id,
-        password,
-    });
+    let credential_update = credential_update(current.as_ref(), legacy_id, encrypted_password);
 
     let registry_snapshot = settings::snapshot()?;
-    let wrote_credential = desired_credential.as_ref() != current.as_ref();
-    if wrote_credential {
-        let desired = desired_credential
-            .as_ref()
-            .expect("資格情報を書き込む場合はIDがある");
+    let wrote_credential = credential_update.is_some();
+    if let Some(desired) = credential_update.as_ref() {
         let credential_result =
             credentials::write_verified(credentials::TARGET, &desired.username, &desired.password);
         if let Err(error) = credential_result {
@@ -289,29 +273,35 @@ pub fn load_or_migrate() -> io::Result<LoadedSettings> {
     if migration_completed {
         return Ok(LoadedSettings {
             settings: existing.unwrap_or_default(),
+            legacy_cleanup_pending: legacy_config_path().is_some_and(|path| path.is_file()),
         });
     }
 
     let Some(path) = legacy_config_path().filter(|path| path.is_file()) else {
         return Ok(LoadedSettings {
             settings: existing.unwrap_or_default(),
+            legacy_cleanup_pending: false,
         });
     };
     let (settings, warning) =
         resolve_migration(existing.clone(), migrate_legacy(&path, existing.as_ref()))?;
+    let legacy_cleanup_pending = warning.is_none();
     if let Some(error) = warning {
         registry_support::show_migration_warning(&error);
     }
-    Ok(LoadedSettings { settings })
+    Ok(LoadedSettings {
+        settings,
+        legacy_cleanup_pending,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        merged_legacy_settings, preferred_password, resolve_migration, with_rollback_errors,
-        LegacySettings,
+        credential_update, decrypt_legacy_password, merged_legacy_settings, resolve_migration,
+        with_rollback_errors, LegacySettings,
     };
-    use crate::settings::Settings;
+    use crate::{credentials::Credential, settings::Settings};
     use serde_json::json;
     use std::io;
 
@@ -452,22 +442,72 @@ mod tests {
     }
 
     #[test]
-    fn prefers_current_then_encrypted_json_then_keytar_password() {
+    fn preserves_a_matching_current_credential() {
         assert_eq!(
-            preferred_password(
-                Some("current".to_owned()),
+            credential_update(
+                Some(&Credential {
+                    username: "user".to_owned(),
+                    password: "current".to_owned(),
+                }),
+                Some("user".to_owned()),
                 Some("json".to_owned()),
-                Some("keytar".to_owned())
             ),
-            Some("current".to_owned())
+            None
         );
+    }
+
+    #[test]
+    fn migrates_a_decrypted_password_when_the_id_changed() {
         assert_eq!(
-            preferred_password(None, Some("json".to_owned()), Some("keytar".to_owned())),
-            Some("json".to_owned())
+            credential_update(
+                Some(&Credential {
+                    username: "current-user".to_owned(),
+                    password: "current".to_owned(),
+                }),
+                Some("legacy-user".to_owned()),
+                Some("json".to_owned()),
+            ),
+            Some(Credential {
+                username: "legacy-user".to_owned(),
+                password: "json".to_owned(),
+            })
         );
+    }
+
+    #[test]
+    fn does_not_overwrite_another_id_with_an_empty_password() {
         assert_eq!(
-            preferred_password(None, None, Some("keytar".to_owned())),
-            Some("keytar".to_owned())
+            credential_update(
+                Some(&Credential {
+                    username: "current-user".to_owned(),
+                    password: "current".to_owned(),
+                }),
+                Some("legacy-user".to_owned()),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn keeps_the_legacy_id_for_password_reentry_when_no_credential_exists() {
+        assert_eq!(
+            credential_update(None, Some("legacy-user".to_owned()), None),
+            Some(Credential {
+                username: "legacy-user".to_owned(),
+                password: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn treats_a_legacy_password_decryption_error_as_missing() {
+        assert_eq!(
+            decrypt_legacy_password(
+                std::path::Path::new(r"C:\legacy\config.json"),
+                "not valid base64!",
+            ),
+            None
         );
     }
 }
