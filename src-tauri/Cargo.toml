@@ -4,6 +4,7 @@ version = "0.1.6"
 description = "Create Web Flow Checker ported from Electron to Tauri without npm"
 authors = ["Kashihara City"]
 edition = "2021"
+license = "MIT"
 
 [[bin]]
 name = "CreateWebFlowChecker"
