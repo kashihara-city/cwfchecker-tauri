@@ -176,7 +176,18 @@ fn migrate_legacy(path: &Path, existing: Option<&Settings>) -> io::Result<Settin
         legacy
             .encpw
             .as_deref()
-            .map(credentials::decrypt_electron_safe_storage)
+            .map(|value| {
+                let local_state = path
+                    .parent()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "旧Electron版設定の親フォルダーを取得できません。",
+                        )
+                    })?
+                    .join("Local State");
+                credentials::decrypt_electron_safe_storage(value, &local_state)
+            })
             .transpose()?
     } else {
         None

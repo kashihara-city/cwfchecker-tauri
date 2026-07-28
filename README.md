@@ -160,6 +160,8 @@ Tauri版の配布前にGPOで設定を管理する場合は、主に次の項目
 - 同じIDの現行資格情報があれば最優先で維持
 - 現行資格情報がなければElectron `safeStorage`の`encpw`、次に
   旧旧keytar資格情報`cwfchecker/<ID>`の順でPWを移行
+- Electronの`v10`/`v11`形式では同じフォルダーの`Local State`から暗号鍵を読み、
+  Windows DPAPIとAES-256-GCMで認証付き復号
 - PWをWindows資格情報マネージャーの`KashiharaCity.CwfChecker`へ保存
 - 書き込み後に通常設定と資格情報を読み返して確認
 - `LegacyMigrationVersion=1`を最後に保存し、認証前に再起動しても再移行しない
