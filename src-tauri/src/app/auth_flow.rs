@@ -10,7 +10,7 @@ use super::{
 use crate::{
     credentials::{self, Credential},
     migration,
-    settings::{Settings, SAML_ID},
+    settings::Settings,
 };
 use std::{
     fs,
@@ -29,6 +29,7 @@ const LOAD_GENERATION_PREFIX: &str = "__CWFCHECKER_LOAD__";
 const LOAD_GENERATION_STORAGE_KEY: &str = "__cwfcheckerLoadGeneration";
 const PORTLET_POST_SCRIPT: &str = include_str!("../../scripts/portlet-post.js");
 const WEBVIEW_SCRIPT: &str = include_str!("../../scripts/cwf-scan.js");
+const SAML_POST_VALUE: &str = "SAML";
 const MAIN_WINDOW_LOGICAL_WIDTH: f64 = 600.0;
 const SCREEN_EDGE_RESERVE_LOGICAL_HEIGHT: f64 = 60.0;
 const CONTENT_HEIGHT_ROUNDING_MARGIN: f64 = 2.0;
@@ -260,17 +261,13 @@ fn load_generation_window_name(generation: usize) -> String {
 
 /// SAMLでは疑似ID/PWを実行時だけ生成し、Windows資格情報を要求しない。
 fn post_credential(settings: &Settings, stored: Option<Credential>) -> Result<Credential, String> {
-    if settings.uses_saml() {
+    if settings.use_saml_auth {
         return Ok(Credential {
-            username: SAML_ID.to_owned(),
-            password: SAML_ID.to_owned(),
+            username: SAML_POST_VALUE.to_owned(),
+            password: SAML_POST_VALUE.to_owned(),
         });
     }
-    let credential = stored.ok_or_else(|| "PWが保存されていません。".to_owned())?;
-    if credential.username != settings.id {
-        return Err("設定中のIDと保存済みPWのIDが一致しません。".to_owned());
-    }
-    Ok(credential)
+    stored.ok_or_else(|| "ID/PWが保存されていません。".to_owned())
 }
 
 /// 次の文書へ世代印を渡してから、現在ページを通常reloadするJavaScriptを作る。
@@ -295,7 +292,7 @@ pub(super) fn portlet_post_script(
     generation: usize,
 ) -> Result<String, String> {
     let settings = settings_snapshot(state)?;
-    let stored = if settings.uses_saml() {
+    let stored = if settings.use_saml_auth {
         None
     } else {
         credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
@@ -308,7 +305,7 @@ pub(super) fn portlet_post_script(
         "action": build_portlet_endpoint(&settings)?.as_str(),
         "fields": [
             ["view", "recv"],
-            ["loginid", settings.id.as_str()],
+            ["loginid", credential.username.as_str()],
             ["pwd", credential.password.as_str()],
             ["ldapsvr", settings.ad_server.as_str()],
         ],
@@ -552,8 +549,8 @@ pub(super) fn process_page_report(
     if report.auth_count > 0 {
         // 認証成功の目印を同一オリジンのページで確認できた時点でのみ、
         // 移行元を削除する。単なる書き込み後照合だけでは削除しない。
-        if let Ok(current) = settings_snapshot(state) {
-            let _ = credentials::delete(&credentials::legacy_target(&current.id));
+        if let Ok(Some(current)) = credentials::read(credentials::TARGET) {
+            let _ = credentials::delete(&credentials::legacy_target(&current.username));
         }
         if let Some(path) = migration::legacy_config_path() {
             let _ = fs::remove_file(path);
@@ -613,38 +610,33 @@ mod tests {
     #[test]
     fn synthesizes_saml_post_values_without_a_stored_credential() {
         let settings = Settings {
-            id: SAML_ID.to_owned(),
             cwf_address: "https://workflow.example/XFV20/".to_owned(),
+            use_saml_auth: true,
             ..Settings::default()
         };
 
         let credential = post_credential(&settings, None).expect("SAML credential");
 
-        assert_eq!(credential.username, SAML_ID);
-        assert_eq!(credential.password, SAML_ID);
+        assert_eq!(credential.username, SAML_POST_VALUE);
+        assert_eq!(credential.password, SAML_POST_VALUE);
     }
 
     #[test]
-    fn requires_a_matching_credential_for_a_normal_id() {
-        let settings = Settings {
-            id: "normal-user".to_owned(),
-            ..Settings::default()
-        };
+    fn requires_a_stored_credential_for_normal_authentication() {
+        let settings = Settings::default();
         assert_eq!(
             post_credential(&settings, None).expect_err("missing password"),
-            "PWが保存されていません。"
+            "ID/PWが保存されていません。"
         );
-        assert_eq!(
-            post_credential(
-                &settings,
-                Some(Credential {
-                    username: "another-user".to_owned(),
-                    password: "secret".to_owned(),
-                })
-            )
-            .expect_err("different ID"),
-            "設定中のIDと保存済みPWのIDが一致しません。"
-        );
+        let credential = post_credential(
+            &settings,
+            Some(Credential {
+                username: "normal-user".to_owned(),
+                password: "secret".to_owned(),
+            }),
+        )
+        .expect("stored credential");
+        assert_eq!(credential.username, "normal-user");
     }
 
     #[test]

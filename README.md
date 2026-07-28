@@ -78,7 +78,6 @@ HKEY_CURRENT_USER\Software\KashiharaCity\CwfChecker
 
 | 値名                     | 設定画面の項目                     | 内容                                            | 初期値・制約          |
 | ------------------------ | ---------------------------------- | ----------------------------------------------- | --------------------- |
-| `Id`                     | ID                                 | Create!WebフローのログインID                    | 必須                  |
 | `AdServer`               | AD Server                          | Active Directoryサーバー名                      | 環境に応じて指定      |
 | `CwfAddress`             | CWFAddress                         | ポートレット画面のURL                           | HTTPまたはHTTPS       |
 | `IntervalMinutes`        | 確認間隔                           | 自動更新間隔（分）                              | 15～360分、初期値15分 |
@@ -109,10 +108,10 @@ HKEY_CURRENT_USER\Software\Classes\AppUserModelId\jp.lg.city.kashihara.cwfchecke
 なければ、exeに埋め込まれたアイコンの自動生成を試みます。生成できた場合は
 その絶対パスを`IconUri`へ登録します。
 
-### パスワード
+### IDとパスワード
 
-パスワードは通常設定のレジストリには保存しません。
-Windows資格情報マネージャーの汎用資格情報として保存します。
+IDとパスワードは通常設定のレジストリには保存せず、
+Windows資格情報マネージャーの1組の汎用資格情報として保存します。
 
 ```text
 ターゲット名: KashiharaCity.CwfChecker
@@ -123,9 +122,9 @@ Windows資格情報マネージャーの汎用資格情報として保存しま�
 保存にはWindowsのCredential APIを使用し、保存直後に読み返して内容を確認します。
 設定画面でPWを空欄にした場合は保存済みPWを維持します。
 IDを変更する場合はPWの再入力が必要です。
-IDを`SAML`にした場合は資格情報を保存せず、POST時だけ`SAML/SAML`を生成します。
-通常認証からSAMLへ切り替えた場合、既存の資格情報は障害時の切り戻し用として残しますが、
-SAML動作中には読み取りもPOSTも行いません。
+`UseSAMLAuth=1`の環境でも利用者が入力したIDを保存します。SAML認証時は保存した
+ID/PWをPOSTせず、実行時だけ`SAML/SAML`を生成します。SAML認証ではPWを空欄のまま
+保存できます。
 
 ### GPO管理用の設定（一般設定と一部共通）
 
@@ -135,16 +134,17 @@ Tauri版の配布前にGPOで設定を管理する場合は、主に次の項目
 | ---------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `CwfAddress`     | `REG_SZ`    | 実際のCreate!WebフローのポートレットURL                                                                                                |
 | `AdServer`       | `REG_SZ`    | 通常認証で使用するAD Server。SAMLでは省略可能                                                                                          |
-| `Id`             | `REG_SZ`    | SAML端末では`SAML`。通常認証では省略可能                                                                                               |
+| `UseSAMLAuth`    | `REG_DWORD` | `1`ならSAML認証、未設定または`0`なら通常認証。アプリの設定画面からは変更しません                                                        |
 | `SchemaVersion`  | `REG_DWORD` | `1` 固定。無い場合、一般のアプリ設定は未設定として扱われます                                                                           |
 | `LatestVersion`  | `REG_SZ`    | 最新バージョン（オプション、それより古いバージョンを起動するとメニューに「⬆ アップデートあり」と表示されます）                                                         |
 | `MinimumVersion` | `REG_SZ`    | 最低バージョン（オプション、それより古いバージョンを起動すると現在のバージョンと必要な最低バージョンを表示し、終了します）                                               |
 
-旧設定がない通常認証端末で`Id`を省略した場合は設定画面が開き、利用者がIDとPWを
-入力します。旧設定が残っている場合は、GPOの有効な`CwfAddress`を維持しながら
+資格情報がない端末では設定画面が開き、利用者がIDとPWを入力します。
+旧設定が残っている場合は、GPOの有効な`CwfAddress`と`UseSAMLAuth`を維持しながら
 旧ID、AD Server、PWなどを一度だけ移行します。旧設定側の項目が空または欠落していれば、
-対応するGPO配布値を維持します。SAML環境でも旧ID/PWのPOSTからIdPへ遷移できることを
-前提に、旧ID/PWを移行して利用できます。
+対応するGPO配布値を維持します。SAML環境では旧ID/PWも資格情報へ移行して保持しますが、
+認証時のPOSTには`SAML/SAML`を使用します。
+レジストリに`Id`が存在していても参照・変更せず、資格情報側のIDを使用します。
 
 ## 旧Electron版からの移行
 
@@ -154,7 +154,8 @@ Tauri版の配布前にGPOで設定を管理する場合は、主に次の項目
 %APPDATA%\createwebflowchecker\config.json
 ```
 
-- ID、AD Server、確認間隔、通知設定、ショートカットをレジストリへ移行
+- AD Server、確認間隔、通知設定、ショートカットをレジストリへ移行
+- IDとPWを1組のWindows資格情報へ移行
 - 旧設定側で空または欠落している項目は、完成済みのRust版設定があれば維持
 - Rust版に有効なCWFAddressが既にあれば維持し、なければ旧CWFAddressを移行
 - 同じIDの現行資格情報があれば最優先で維持
@@ -162,7 +163,7 @@ Tauri版の配布前にGPOで設定を管理する場合は、主に次の項目
   旧旧keytar資格情報`cwfchecker/<ID>`の順でPWを移行
 - Electronの`v10`/`v11`形式では同じフォルダーの`Local State`から暗号鍵を読み、
   Windows DPAPIとAES-256-GCMで認証付き復号
-- PWをWindows資格情報マネージャーの`KashiharaCity.CwfChecker`へ保存
+- ID/PWをWindows資格情報マネージャーの`KashiharaCity.CwfChecker`へ保存
 - 書き込み後に通常設定と資格情報を読み返して確認
 - `LegacyMigrationVersion=1`を最後に保存し、認証前に再起動しても再移行しない
 

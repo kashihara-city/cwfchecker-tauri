@@ -104,7 +104,6 @@ fn merged_legacy_settings(
 ) -> Result<Settings, String> {
     let existing = existing.cloned().unwrap_or_default();
     Settings {
-        id: legacy_text_or_existing(&legacy.id, &existing.id),
         ad_server: legacy_text_or_existing(&legacy.ad, &existing.ad_server),
         cwf_address: if existing.cwf_address.is_empty() {
             legacy.cwfaddress.trim().to_owned()
@@ -118,6 +117,7 @@ fn merged_legacy_settings(
             .unwrap_or(existing.interval_minutes),
         notify_by_bar: legacy.notifybybar.unwrap_or(existing.notify_by_bar),
         shortcut: legacy_text_or_existing(&legacy.shortcut, &existing.shortcut),
+        use_saml_auth: existing.use_saml_auth,
     }
     .normalize()
 }
@@ -129,10 +129,6 @@ fn preferred_password(
     legacy_keytar: Option<String>,
 ) -> Option<String> {
     current.or(encrypted_json).or(legacy_keytar)
-}
-
-fn should_migrate_password(settings: &Settings) -> bool {
-    !settings.id.is_empty() && !settings.uses_saml()
 }
 
 fn resolve_migration(
@@ -160,19 +156,24 @@ fn migrate_legacy(path: &Path, existing: Option<&Settings>) -> io::Result<Settin
     let migrated = merged_legacy_settings(&legacy, existing)
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
 
-    // 同じIDの現行資格情報を最優先し、なければsafeStorage、旧keytarの順に試す。
-    // 別IDの現行資格情報は誤って流用しない。
-    let migrate_password = should_migrate_password(&migrated);
-    let current = if migrate_password {
-        credentials::read(credentials::TARGET)?
+    // ID/PWは一組で現行資格情報へ移す。同じIDの現行PWを最優先し、なければ
+    // safeStorage、旧keytarの順に試す。PWがなくてもIDは空PWとともに保持し、
+    // 通常認証なら設定画面でPW入力を求められる状態にする。
+    let current = credentials::read(credentials::TARGET)?;
+    let legacy_id = legacy.id.trim();
+    let credential_id = if legacy_id.is_empty() {
+        current
+            .as_ref()
+            .map(|credential| credential.username.trim().to_owned())
+            .unwrap_or_default()
     } else {
-        None
+        legacy_id.to_owned()
     };
     let current_password = current
         .as_ref()
-        .filter(|credential| credential.username == migrated.id)
+        .filter(|credential| credential.username == credential_id)
         .map(|credential| credential.password.clone());
-    let encrypted_password = if migrate_password && current_password.is_none() {
+    let encrypted_password = if !credential_id.is_empty() && current_password.is_none() {
         legacy
             .encpw
             .as_deref()
@@ -192,30 +193,34 @@ fn migrate_legacy(path: &Path, existing: Option<&Settings>) -> io::Result<Settin
     } else {
         None
     };
-    let legacy_password =
-        if migrate_password && current_password.is_none() && encrypted_password.is_none() {
-            credentials::read(&credentials::legacy_target(&migrated.id))?
-                .map(|credential| credential.password)
-        } else {
-            None
-        };
-    let password = if migrate_password {
-        preferred_password(
-            current_password.clone(),
-            encrypted_password,
-            legacy_password,
-        )
+    let legacy_password = if !credential_id.is_empty()
+        && current_password.is_none()
+        && encrypted_password.is_none()
+    {
+        credentials::read(&credentials::legacy_target(&credential_id))?
+            .map(|credential| credential.password)
     } else {
         None
     };
+    let password = preferred_password(
+        current_password.clone(),
+        encrypted_password,
+        legacy_password,
+    )
+    .unwrap_or_default();
+    let desired_credential = (!credential_id.is_empty()).then_some(credentials::Credential {
+        username: credential_id,
+        password,
+    });
 
     let registry_snapshot = settings::snapshot()?;
-    // 同じ現行資格情報を選んだ場合は再書き込みせず、旧値を採用した場合だけ変更する。
-    let wrote_credential = password.is_some() && current_password != password;
+    let wrote_credential = desired_credential.as_ref() != current.as_ref();
     if wrote_credential {
-        let password = password.as_deref().expect("password checked above");
+        let desired = desired_credential
+            .as_ref()
+            .expect("資格情報を書き込む場合はIDがある");
         let credential_result =
-            credentials::write_verified(credentials::TARGET, &migrated.id, password);
+            credentials::write_verified(credentials::TARGET, &desired.username, &desired.password);
         if let Err(error) = credential_result {
             return Err(with_rollback_errors(
                 error,
@@ -303,8 +308,8 @@ pub fn load_or_migrate() -> io::Result<LoadedSettings> {
 #[cfg(test)]
 mod tests {
     use super::{
-        merged_legacy_settings, preferred_password, resolve_migration, should_migrate_password,
-        with_rollback_errors, LegacySettings,
+        merged_legacy_settings, preferred_password, resolve_migration, with_rollback_errors,
+        LegacySettings,
     };
     use crate::settings::Settings;
     use serde_json::json;
@@ -338,7 +343,6 @@ mod tests {
     #[test]
     fn keeps_valid_existing_settings_when_legacy_migration_fails() {
         let existing = Settings {
-            id: "current-user".to_owned(),
             cwf_address: "https://gpo.example/XFV20/".to_owned(),
             ..Settings::default()
         };
@@ -385,7 +389,6 @@ mod tests {
 
         let merged = merged_legacy_settings(&legacy, Some(&existing)).expect("merge");
 
-        assert_eq!(merged.id, "legacy-user");
         assert_eq!(merged.cwf_address, "https://gpo.example/XFV20/");
         assert_eq!(merged.interval_minutes, 20);
     }
@@ -405,12 +408,12 @@ mod tests {
     #[test]
     fn preserves_existing_values_for_empty_or_missing_legacy_fields() {
         let existing = Settings {
-            id: crate::settings::SAML_ID.to_owned(),
             ad_server: "gpo-ad".to_owned(),
             cwf_address: "https://gpo.example/XFV20/".to_owned(),
             interval_minutes: 30,
             notify_by_bar: true,
             shortcut: "F4".to_owned(),
+            use_saml_auth: true,
         };
 
         let merged =
@@ -422,12 +425,12 @@ mod tests {
     #[test]
     fn uses_explicit_legacy_values_except_for_the_existing_cwf_address() {
         let existing = Settings {
-            id: crate::settings::SAML_ID.to_owned(),
             ad_server: "gpo-ad".to_owned(),
             cwf_address: "https://gpo.example/XFV20/".to_owned(),
             interval_minutes: 30,
             notify_by_bar: true,
             shortcut: "F4".to_owned(),
+            use_saml_auth: true,
         };
         let legacy = LegacySettings {
             id: "legacy-user".to_owned(),
@@ -441,7 +444,6 @@ mod tests {
 
         let merged = merged_legacy_settings(&legacy, Some(&existing)).expect("merge");
 
-        assert_eq!(merged.id, "legacy-user");
         assert_eq!(merged.ad_server, "legacy-ad");
         assert_eq!(merged.cwf_address, "https://gpo.example/XFV20/");
         assert_eq!(merged.interval_minutes, 20);
@@ -467,18 +469,5 @@ mod tests {
             preferred_password(None, None, Some("keytar".to_owned())),
             Some("keytar".to_owned())
         );
-    }
-
-    #[test]
-    fn does_not_migrate_a_password_for_an_empty_or_saml_id() {
-        assert!(!should_migrate_password(&Settings::default()));
-        assert!(!should_migrate_password(&Settings {
-            id: crate::settings::SAML_ID.to_owned(),
-            ..Settings::default()
-        }));
-        assert!(should_migrate_password(&Settings {
-            id: "normal-user".to_owned(),
-            ..Settings::default()
-        }));
     }
 }

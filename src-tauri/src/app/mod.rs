@@ -113,6 +113,18 @@ fn settings_snapshot(state: &AppState) -> Result<Settings, String> {
         .map_err(|_| lock_error())
 }
 
+fn normalize_id(id: String) -> Result<String, String> {
+    if id.chars().any(char::is_control) {
+        return Err("IDには制御文字を含めないでください。".to_owned());
+    }
+    let id = id.trim().to_owned();
+    if id.is_empty() {
+        Err("IDを入力してください。".to_owned())
+    } else {
+        Ok(id)
+    }
+}
+
 /// `withGlobalTauri`はリモートのCWF画面にもIPCブリッジを公開する。
 ///
 /// capabilityだけでなく、すべてのTauriコマンドでこの検査を行い、
@@ -136,19 +148,17 @@ fn build_portlet_endpoint(settings: &Settings) -> Result<Url, String> {
 
 fn configured_url(state: &AppState) -> Result<Option<Url>, String> {
     let settings = settings_snapshot(state)?;
-    if settings.cwf_address.is_empty() || settings.id.is_empty() {
+    if settings.cwf_address.is_empty() {
         return Ok(None);
-    }
-    if settings.uses_saml() {
-        return build_portlet_endpoint(&settings).map(Some);
     }
     let Some(credential) =
         credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
     else {
         return Ok(None);
     };
-    if credential.username != settings.id {
-        // 別IDの資格情報を誤って使用しない。設定画面でPWを再入力すれば修復できる。
+    if credential.username.trim().is_empty()
+        || (!settings.use_saml_auth && credential.password.is_empty())
+    {
         return Ok(None);
     }
     build_portlet_endpoint(&settings).map(Some)
@@ -179,8 +189,12 @@ pub fn get_settings(
 ) -> Result<SettingsView, String> {
     ensure_settings_window(&window)?;
     let settings = settings_snapshot(&state)?;
+    let id = credentials::read(credentials::TARGET)
+        .map_err(|error| error.to_string())?
+        .map(|credential| credential.username)
+        .unwrap_or_default();
     Ok(SettingsView {
-        id: settings.id,
+        id,
         ad_server: settings.ad_server,
         cwf_address: settings.cwf_address,
         interval_minutes: settings.interval_minutes,
@@ -199,18 +213,17 @@ pub fn save_settings(
     input: SettingsInput,
 ) -> Result<(), String> {
     ensure_settings_window(&window)?;
+    let id = normalize_id(input.id)?;
+    let use_saml_auth = settings_snapshot(&state)?.use_saml_auth;
     let settings = Settings {
-        id: input.id,
         ad_server: input.ad_server,
         cwf_address: input.cwf_address,
         interval_minutes: input.interval_minutes,
         notify_by_bar: input.notify_by_bar,
         shortcut: input.shortcut,
+        use_saml_auth,
     }
     .normalize()?;
-    if settings.id.is_empty() {
-        return Err("IDを入力してください。".to_owned());
-    }
     // レジストリ保存が途中で失敗したときに、GPO値も含む変更前の型と値へ戻す。
     let registry_snapshot = registry_support::report_io(
         "アプリ設定の変更前状態の読み込み",
@@ -219,37 +232,31 @@ pub fn save_settings(
     )
     .map_err(|error| error.to_string())?;
 
-    // SAMLでは固定のPOST値を実行時に生成し、資格情報マネージャーへは保存しない。
-    // 通常認証では保存済みPWをWebViewへ返さず、空欄ならRust側で引き継ぐ。
-    let wrote_credential = !settings.uses_saml();
-    let existing = if wrote_credential {
-        credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
-    } else {
-        None
-    };
-    if wrote_credential {
-        let password = if input.password.is_empty() {
-            let existing = existing
-                .as_ref()
-                .ok_or_else(|| "PWを入力してください。".to_owned())?;
-            if existing.username != settings.id {
-                return Err("IDを変更する場合はPWも入力してください。".to_owned());
+    // ID/PWは一組のWindows資格情報として保存する。PW空欄では同じIDの既存値を
+    // 維持し、SAMLで新規またはID変更の場合だけ空PWを許可する。
+    let existing = credentials::read(credentials::TARGET).map_err(|error| error.to_string())?;
+    let password = if input.password.is_empty() {
+        if let Some(existing) = existing.as_ref().filter(|value| value.username == id) {
+            if !settings.use_saml_auth && existing.password.is_empty() {
+                return Err("PWを入力してください。".to_owned());
             }
             existing.password.clone()
+        } else if settings.use_saml_auth {
+            String::new()
         } else {
-            input.password
-        };
-        if let Err(error) =
-            credentials::write_verified(credentials::TARGET, &settings.id, &password)
-        {
-            let mut message = error.to_string();
-            if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
-                message.push_str(&format!(
-                    "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
-                ));
-            }
-            return Err(message);
+            return Err("IDを変更する場合はPWも入力してください。".to_owned());
         }
+    } else {
+        input.password
+    };
+    if let Err(error) = credentials::write_verified(credentials::TARGET, &id, &password) {
+        let mut message = error.to_string();
+        if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
+            message.push_str(&format!(
+                "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
+            ));
+        }
+        return Err(message);
     }
 
     // 既にこのアプリが登録済みなら再登録しない。変更時は旧キーを残したまま
@@ -265,12 +272,10 @@ pub fn save_settings(
             "ショートカットキー「{}」を登録できませんでした。ほかのアプリで使用されていないキーを指定してください。\n{error}",
             settings.shortcut
         );
-        if wrote_credential {
-            if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
-                message.push_str(&format!(
-                    "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
-                ));
-            }
+        if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
+            message.push_str(&format!(
+                "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
+            ));
         }
         return Err(message);
     } else {
@@ -306,7 +311,7 @@ pub fn save_settings(
             registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
             settings::restore_snapshot(&registry_snapshot),
         );
-        let credential_rollback = wrote_credential.then(|| credentials::restore(existing.as_ref()));
+        let credential_rollback = credentials::restore(existing.as_ref());
         let mut message = error;
         if registered_for_save {
             if let Err(rollback_error) = app.global_shortcut().unregister(shortcut) {
@@ -320,7 +325,7 @@ pub fn save_settings(
                 "\nアプリ設定を変更前の状態へ戻せませんでした: {rollback_error}"
             ));
         }
-        if let Some(Err(rollback_error)) = credential_rollback {
+        if let Err(rollback_error) = credential_rollback {
             message.push_str(&format!(
                 "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
             ));
@@ -377,7 +382,10 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_portlet_endpoint, has_allowed_origin, CURRENT_VERSION, NOTIFICATION_TITLE};
+    use super::{
+        build_portlet_endpoint, has_allowed_origin, normalize_id, CURRENT_VERSION,
+        NOTIFICATION_TITLE,
+    };
     use crate::settings::Settings;
     use url::Url;
 
@@ -399,9 +407,17 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_and_validates_credential_ids() {
+        assert_eq!(normalize_id("  USER  ".to_owned()).expect("ID"), "USER");
+        assert!(normalize_id("  ".to_owned()).unwrap_err().contains("ID"));
+        assert!(normalize_id("USER\u{0007}".to_owned())
+            .unwrap_err()
+            .contains("制御文字"));
+    }
+
+    #[test]
     fn builds_a_portlet_endpoint_without_credentials_in_the_url() {
         let settings = Settings {
-            id: "TESTUSER".to_owned(),
             cwf_address: "https://workflow.example/XFV20/portlet/wfportlet.jsp?old=value#fragment"
                 .to_owned(),
             ..Settings::default()
@@ -412,7 +428,6 @@ mod tests {
             endpoint.as_str(),
             "https://workflow.example/XFV20/portlet/wfportlet.jsp"
         );
-        assert!(!endpoint.as_str().contains(&settings.id));
     }
 
     #[test]

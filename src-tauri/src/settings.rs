@@ -13,20 +13,19 @@ use winreg::{
 pub const REGISTRY_PATH: &str = r"Software\KashiharaCity\CwfChecker";
 const SCHEMA_VERSION: u32 = 1;
 const LEGACY_MIGRATION_VERSION: u32 = 1;
-const VALUE_ID: &str = "Id";
 const VALUE_AD_SERVER: &str = "AdServer";
 const VALUE_CWF_ADDRESS: &str = "CwfAddress";
 const VALUE_INTERVAL_MINUTES: &str = "IntervalMinutes";
 const VALUE_NOTIFY_BY_BAR: &str = "NotifyByBar";
 const VALUE_SHORTCUT: &str = "Shortcut";
+const VALUE_USE_SAML_AUTH: &str = "UseSAMLAuth";
 const VALUE_SCHEMA_VERSION: &str = "SchemaVersion";
 const LEGACY_MIGRATION_VALUE: &str = "LegacyMigrationVersion";
-pub const SAML_ID: &str = "SAML";
 pub const MAX_INTERVAL_MINUTES: u32 = 360;
 // 同じキーにあるAppVersion・LatestVersion・MinimumVersionはversion_policyの管理値。
 // 一般設定の保存失敗時にGPO値や実行版の記録を巻き戻さないため、ここには含めない。
-const SETTINGS_VALUE_NAMES: [&str; 8] = [
-    VALUE_ID,
+// UseSAMLAuthも管理者配布値なので、アプリの書込み・復元対象には含めない。
+const SETTINGS_VALUE_NAMES: [&str; 7] = [
     VALUE_AD_SERVER,
     VALUE_CWF_ADDRESS,
     VALUE_INTERVAL_MINUTES,
@@ -54,45 +53,36 @@ fn migration_version_completed(version: u32) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
-    pub id: String,
     pub ad_server: String,
     pub cwf_address: String,
     pub interval_minutes: u32,
     pub notify_by_bar: bool,
     pub shortcut: String,
+    pub use_saml_auth: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            id: String::new(),
             ad_server: String::new(),
             cwf_address: String::new(),
             interval_minutes: 15,
             notify_by_bar: false,
             shortcut: "F3".to_owned(),
+            use_saml_auth: false,
         }
     }
 }
 
 impl Settings {
-    /// `SAML`は実在する資格情報ではなく、CWF側でSAMLを開始するための予約ID。
-    pub fn uses_saml(&self) -> bool {
-        self.id == SAML_ID
-    }
-
     /// 余分な空白を除去し、保存してよい値かを検証する。
     ///
     /// この関数を読み書きの境界で必ず通すことで、レジストリ、メモリ、
     /// 設定画面の間で異なる形式の値を持たないようにしている。
     pub fn normalize(mut self) -> Result<Self, String> {
-        if self.id.chars().any(char::is_control) {
-            return Err("IDには制御文字を含めないでください。".to_owned());
-        }
         if self.ad_server.chars().any(char::is_control) {
             return Err("AD Serverには制御文字を含めないでください。".to_owned());
         }
-        self.id = self.id.trim().to_owned();
         self.ad_server = self.ad_server.trim().to_owned();
         self.cwf_address = self.cwf_address.trim().to_owned();
         self.shortcut = self.shortcut.trim().to_owned();
@@ -174,7 +164,7 @@ pub fn mark_legacy_migrated() -> io::Result<()> {
     }
 }
 
-/// 現行SchemaVersionの設定を読む。キーなし・未完成・旧形式は`None`を返す。
+/// 現行SchemaVersionの設定を読む。
 pub fn read() -> io::Result<Option<Settings>> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     // AppVersionの登録だけでも起動時にキーが作られるため、キーの存在を設定済みの
@@ -201,8 +191,8 @@ pub fn read() -> io::Result<Option<Settings>> {
         .get_value::<u32, _>(VALUE_INTERVAL_MINUTES)
         .unwrap_or(15);
     let notify = key.get_value::<u32, _>(VALUE_NOTIFY_BY_BAR).unwrap_or(0);
+    let use_saml_auth = key.get_value::<u32, _>(VALUE_USE_SAML_AUTH).unwrap_or(0) != 0;
     let settings = Settings {
-        id: key.get_value(VALUE_ID).unwrap_or_default(),
         ad_server: key.get_value(VALUE_AD_SERVER).unwrap_or_default(),
         cwf_address: key.get_value(VALUE_CWF_ADDRESS).unwrap_or_default(),
         interval_minutes,
@@ -210,6 +200,7 @@ pub fn read() -> io::Result<Option<Settings>> {
         shortcut: key
             .get_value(VALUE_SHORTCUT)
             .unwrap_or_else(|_| "F3".to_owned()),
+        use_saml_auth,
     }
     // レジストリはregedit等でも変更できるため、保存時だけでなく読込時にも
     // 同じ正規化・検証を行い、メモリへ不正な設定を持ち込まない。
@@ -237,7 +228,6 @@ fn write_at(path: &str, settings: &Settings) -> io::Result<()> {
             return Err(error);
         }
     }
-    key.set_value(VALUE_ID, &settings.id)?;
     key.set_value(VALUE_AD_SERVER, &settings.ad_server)?;
     key.set_value(VALUE_CWF_ADDRESS, &settings.cwf_address)?;
     key.set_value(VALUE_INTERVAL_MINUTES, &settings.interval_minutes)?;
@@ -324,7 +314,7 @@ pub fn restore_snapshot(snapshot: &RegistrySnapshot) -> io::Result<()> {
 mod tests {
     use super::{
         migration_version_completed, restore_snapshot_at, snapshot_at, write_at, Settings,
-        MAX_INTERVAL_MINUTES, SAML_ID, SETTINGS_VALUE_NAMES,
+        MAX_INTERVAL_MINUTES, SETTINGS_VALUE_NAMES,
     };
     use std::time::SystemTime;
     use winreg::{
@@ -367,7 +357,6 @@ mod tests {
     #[test]
     fn normalizes_values_loaded_from_storage() {
         let settings = Settings {
-            id: "  USER  ".to_owned(),
             cwf_address: "  https://workflow.example/XFV20/  ".to_owned(),
             interval_minutes: 0,
             shortcut: "  F3  ".to_owned(),
@@ -376,7 +365,6 @@ mod tests {
         .normalize()
         .expect("normalized settings");
 
-        assert_eq!(settings.id, "USER");
         assert_eq!(settings.cwf_address, "https://workflow.example/XFV20/");
         assert_eq!(settings.interval_minutes, 15);
         assert_eq!(settings.shortcut, "F3");
@@ -402,13 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_control_characters_in_identity_fields() {
-        let id_error = Settings {
-            id: "USER\u{0007}NAME".to_owned(),
-            ..Settings::default()
-        }
-        .normalize()
-        .unwrap_err();
+    fn rejects_control_characters_in_ad_server() {
         let ad_server_error = Settings {
             ad_server: "AD SERVER\r".to_owned(),
             ..Settings::default()
@@ -416,20 +398,12 @@ mod tests {
         .normalize()
         .unwrap_err();
 
-        assert!(id_error.contains("ID"));
         assert!(ad_server_error.contains("AD Server"));
     }
 
     #[test]
-    fn recognizes_only_the_reserved_saml_id() {
-        let mut settings = Settings {
-            id: SAML_ID.to_owned(),
-            ..Settings::default()
-        };
-        assert!(settings.uses_saml());
-
-        settings.id = "saml".to_owned();
-        assert!(!settings.uses_saml());
+    fn defaults_to_normal_authentication() {
+        assert!(!Settings::default().use_saml_auth);
     }
 
     #[test]
@@ -448,12 +422,12 @@ mod tests {
         let test_root = r"Software\KashiharaCity\CwfCheckerTests";
         let path = format!(r"{test_root}\written-values-{}-{nonce}", std::process::id());
         let settings = Settings {
-            id: "USER".to_owned(),
             ad_server: "ADSERVER".to_owned(),
             cwf_address: "https://workflow.example/XFV20/".to_owned(),
             interval_minutes: 30,
             notify_by_bar: true,
             shortcut: "SHIFT+F2".to_owned(),
+            use_saml_auth: false,
         };
 
         write_at(&path, &settings).expect("write settings to test key");
@@ -501,7 +475,10 @@ mod tests {
             .expect("add managed value");
         restore_snapshot_at(&path, &snapshot).expect("restore");
 
-        assert_eq!(key.get_value::<String, _>("Id").expect("read ID"), "before");
+        assert_eq!(
+            key.get_value::<String, _>("Id").expect("read unmanaged ID"),
+            "after"
+        );
         assert_eq!(
             key.get_value::<u32, _>("SchemaVersion")
                 .expect("read schema"),

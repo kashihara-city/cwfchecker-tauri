@@ -66,7 +66,7 @@ impl Drop for KeyHandle {
 }
 
 /// 資格情報マネージャーから読み出したユーザー名とパスワード。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Credential {
     pub username: String,
     pub password: String,
