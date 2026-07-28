@@ -212,6 +212,10 @@ fn handle_tray_menu(app: &AppHandle, id: &str) {
     }
 }
 
+fn only_main_window<S: AsRef<str>>(labels: impl IntoIterator<Item = S>) -> bool {
+    labels.into_iter().all(|label| label.as_ref() == MAIN_LABEL)
+}
+
 /// 閉じるボタンを「常駐」に置き換え、案件画面終了時には一時ファイルを片付ける。
 pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
     let app = window.app_handle();
@@ -251,16 +255,29 @@ pub fn handle_shortcut(
 ) {
     if event.state == ShortcutState::Pressed {
         if let Some(main) = app.get_webview_window(MAIN_LABEL) {
-            if main.is_visible().unwrap_or(false)
-                && app
-                    .webview_windows()
-                    .keys()
-                    .all(|label| !label.starts_with("decision-"))
+            if main.is_visible().unwrap_or(false) && only_main_window(app.webview_windows().keys())
             {
                 let _ = main.hide();
             } else {
                 show_main(app);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::only_main_window;
+
+    #[test]
+    fn allows_hiding_when_only_the_main_window_exists() {
+        assert!(only_main_window(["main"]));
+    }
+
+    #[test]
+    fn prevents_hiding_when_any_other_window_exists() {
+        assert!(!only_main_window(["main", "settings"]));
+        assert!(!only_main_window(["main", "decision-1"]));
+        assert!(!only_main_window(["main", "decision-child-1"]));
     }
 }

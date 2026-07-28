@@ -30,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager, WebviewWindow};
-use tauri_plugin_global_shortcut::GlobalShortcutExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use tauri_plugin_notification::NotificationExt;
 use url::Url;
 
@@ -191,7 +191,7 @@ pub fn get_settings(
 }
 
 #[tauri::command]
-/// 設定画面の入力を検証し、資格情報とレジストリへ保存するTauriコマンド。
+/// 設定画面の入力を検証し、ショートカット、資格情報、レジストリへ反映する。
 pub fn save_settings(
     app: AppHandle,
     window: WebviewWindow,
@@ -252,6 +252,31 @@ pub fn save_settings(
         }
     }
 
+    // 既にこのアプリが登録済みなら再登録しない。変更時は旧キーを残したまま
+    // 新キーを先に登録し、競合していれば永続化せず設定画面へエラーを返す。
+    let shortcut = settings
+        .shortcut
+        .parse::<Shortcut>()
+        .expect("normalize済みのショートカット");
+    let registered_for_save = if app.global_shortcut().is_registered(shortcut) {
+        false
+    } else if let Err(error) = app.global_shortcut().register(shortcut) {
+        let mut message = format!(
+            "ショートカットキー「{}」を登録できませんでした。ほかのアプリで使用されていないキーを指定してください。\n{error}",
+            settings.shortcut
+        );
+        if wrote_credential {
+            if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
+                message.push_str(&format!(
+                    "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
+                ));
+            }
+        }
+        return Err(message);
+    } else {
+        true
+    };
+
     let registry_result = (|| -> Result<(), String> {
         // 小さなクロージャーにすることで、途中の`?`をまとめて1個のResultとして扱う。
         registry_support::report_io(
@@ -283,6 +308,13 @@ pub fn save_settings(
         );
         let credential_rollback = wrote_credential.then(|| credentials::restore(existing.as_ref()));
         let mut message = error;
+        if registered_for_save {
+            if let Err(rollback_error) = app.global_shortcut().unregister(shortcut) {
+                message.push_str(&format!(
+                    "\n新しいショートカットキーの登録を解除できませんでした: {rollback_error}"
+                ));
+            }
+        }
         if let Err(rollback_error) = registry_rollback {
             message.push_str(&format!(
                 "\nアプリ設定を変更前の状態へ戻せませんでした: {rollback_error}"
