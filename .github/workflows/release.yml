@@ -1,0 +1,163 @@
+name: Release Windows application
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup default 1.97.1
+
+      # Install before changing the project lockfile. The repository cooldown
+      # policy applies to builds performed after Cargo.lock is changed.
+      - name: Install cargo-audit
+        shell: pwsh
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Set application version from tag
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:TAG_NAME
+          $tagMatch = [regex]::Match(
+            $tag,
+            '^v(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$'
+          )
+          if (-not $tagMatch.Success) {
+            throw "Tag '$tag' must have the form v1.2.3 or v1.2.3-prerelease."
+          }
+          $version = $tagMatch.Groups["version"].Value
+
+          $cargoTomlPath = "src-tauri/Cargo.toml"
+          $cargoToml = Get-Content -LiteralPath $cargoTomlPath -Raw
+          $cargoVersionPattern = [regex]::new(
+            '(?m)^(?<prefix>version = ")[^"]+(?<suffix>")$'
+          )
+          $cargoToml = $cargoVersionPattern.Replace(
+            $cargoToml,
+            "`${prefix}$version`${suffix}",
+            1
+          )
+          Set-Content -LiteralPath $cargoTomlPath -Value $cargoToml -Encoding utf8 -NoNewline
+
+          $tauriConfigPath = "src-tauri/tauri.conf.json"
+          $tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw
+          $tauriVersionPattern = [regex]::new(
+            '(?m)^(?<prefix>\s*"version":\s*")[^"]+(?<suffix>",)$'
+          )
+          $tauriConfig = $tauriVersionPattern.Replace(
+            $tauriConfig,
+            "`${prefix}$version`${suffix}",
+            1
+          )
+          Set-Content -LiteralPath $tauriConfigPath -Value $tauriConfig -Encoding utf8 -NoNewline
+
+          $lockPath = "src-tauri/Cargo.lock"
+          $lockContent = Get-Content -LiteralPath $lockPath -Raw
+          $packagePattern = [regex]::new(
+            '(?ms)(?<prefix>\[\[package\]\]\s+name = "cwfchecker-tauri-no-npm"\s+version = ")[^"]+(?<suffix>")'
+          )
+          $lockContent = $packagePattern.Replace(
+            $lockContent,
+            "`${prefix}$version`${suffix}",
+            1
+          )
+          Set-Content -LiteralPath $lockPath -Value $lockContent -Encoding utf8 -NoNewline
+
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Populate Cargo sparse-index cache
+        shell: pwsh
+        run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Enforce three-day dependency cooldown
+        shell: pwsh
+        run: |
+          ./.github/scripts/resolve-cargo-cooldown.ps1 `
+            -ManifestPath src-tauri/Cargo.toml `
+            -MinimumAgeDays 3
+
+      - name: Audit locked dependencies
+        shell: pwsh
+        run: cargo audit --file src-tauri/Cargo.lock
+
+      - name: Build release executable
+        shell: pwsh
+        run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Package executable
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archiveName = "CreateWebFlowChecker-v$env:RELEASE_VERSION-windows-x64.zip"
+          $archivePath = Join-Path $env:RUNNER_TEMP $archiveName
+          Compress-Archive `
+            -LiteralPath "src-tauri/target/release/CreateWebFlowChecker.exe" `
+            -DestinationPath $archivePath `
+            -CompressionLevel Optimal
+
+          $checksumName = "$archiveName.sha256"
+          $checksumPath = Join-Path $env:RUNNER_TEMP $checksumName
+          $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$archiveHash  $archiveName" |
+            Set-Content -LiteralPath $checksumPath -Encoding ascii
+
+          "archive_path=$archivePath" >> $env:GITHUB_OUTPUT
+          "checksum_path=$checksumPath" >> $env:GITHUB_OUTPUT
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
+          CHECKSUM_PATH: ${{ steps.package.outputs.checksum_path }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = $env:TAG_NAME
+          gh release view $tag --repo $env:REPOSITORY *> $null
+
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload `
+              $tag `
+              $env:ARCHIVE_PATH `
+              $env:CHECKSUM_PATH `
+              --clobber `
+              --repo $env:REPOSITORY
+          } else {
+            gh release create `
+              $tag `
+              $env:ARCHIVE_PATH `
+              $env:CHECKSUM_PATH `
+              --verify-tag `
+              --generate-notes `
+              --title "CreateWebFlowChecker $tag" `
+              --repo $env:REPOSITORY
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub Release publication failed with exit code $LASTEXITCODE."
+          }
