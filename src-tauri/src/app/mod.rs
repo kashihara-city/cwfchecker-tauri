@@ -113,15 +113,19 @@ fn settings_snapshot(state: &AppState) -> Result<Settings, String> {
         .map_err(|_| lock_error())
 }
 
-fn normalize_id(id: String) -> Result<String, String> {
+fn normalize_id(id: String, allow_empty: bool) -> Result<Option<String>, String> {
     if id.chars().any(char::is_control) {
         return Err("IDには制御文字を含めないでください。".to_owned());
     }
     let id = id.trim().to_owned();
     if id.is_empty() {
-        Err("IDを入力してください。".to_owned())
+        if allow_empty {
+            Ok(None)
+        } else {
+            Err("IDを入力してください。".to_owned())
+        }
     } else {
-        Ok(id)
+        Ok(Some(id))
     }
 }
 
@@ -150,6 +154,9 @@ fn configured_url(state: &AppState) -> Result<Option<Url>, String> {
     let settings = settings_snapshot(state)?;
     if settings.cwf_address.is_empty() {
         return Ok(None);
+    }
+    if settings.use_saml_auth {
+        return build_portlet_endpoint(&settings).map(Some);
     }
     let Some(credential) =
         credentials::read(credentials::TARGET).map_err(|error| error.to_string())?
@@ -213,8 +220,8 @@ pub fn save_settings(
     input: SettingsInput,
 ) -> Result<(), String> {
     ensure_settings_window(&window)?;
-    let id = normalize_id(input.id)?;
     let use_saml_auth = settings_snapshot(&state)?.use_saml_auth;
+    let id = normalize_id(input.id, use_saml_auth)?;
     let settings = Settings {
         ad_server: input.ad_server,
         cwf_address: input.cwf_address,
@@ -232,31 +239,34 @@ pub fn save_settings(
     )
     .map_err(|error| error.to_string())?;
 
-    // ID/PWは一組のWindows資格情報として保存する。PW空欄では同じIDの既存値を
-    // 維持し、SAMLで新規またはID変更の場合だけ空PWを許可する。
+    // SAMLの空IDでは資格情報を変更しない。IDがあればID/PWを一組で保存し、
+    // PW空欄では同じIDの既存値を維持する。
     let existing = credentials::read(credentials::TARGET).map_err(|error| error.to_string())?;
-    let password = if input.password.is_empty() {
-        if let Some(existing) = existing.as_ref().filter(|value| value.username == id) {
-            if !settings.use_saml_auth && existing.password.is_empty() {
-                return Err("PWを入力してください。".to_owned());
+    let wrote_credential = id.is_some();
+    if let Some(id) = id.as_deref() {
+        let password = if input.password.is_empty() {
+            if let Some(existing) = existing.as_ref().filter(|value| value.username == id) {
+                if !settings.use_saml_auth && existing.password.is_empty() {
+                    return Err("PWを入力してください。".to_owned());
+                }
+                existing.password.clone()
+            } else if settings.use_saml_auth {
+                String::new()
+            } else {
+                return Err("IDを変更する場合はPWも入力してください。".to_owned());
             }
-            existing.password.clone()
-        } else if settings.use_saml_auth {
-            String::new()
         } else {
-            return Err("IDを変更する場合はPWも入力してください。".to_owned());
+            input.password
+        };
+        if let Err(error) = credentials::write_verified(credentials::TARGET, id, &password) {
+            let mut message = error.to_string();
+            if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
+                message.push_str(&format!(
+                    "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
+                ));
+            }
+            return Err(message);
         }
-    } else {
-        input.password
-    };
-    if let Err(error) = credentials::write_verified(credentials::TARGET, &id, &password) {
-        let mut message = error.to_string();
-        if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
-            message.push_str(&format!(
-                "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
-            ));
-        }
-        return Err(message);
     }
 
     // 既にこのアプリが登録済みなら再登録しない。変更時は旧キーを残したまま
@@ -272,10 +282,12 @@ pub fn save_settings(
             "ショートカットキー「{}」を登録できませんでした。ほかのアプリで使用されていないキーを指定してください。\n{error}",
             settings.shortcut
         );
-        if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
-            message.push_str(&format!(
-                "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
-            ));
+        if wrote_credential {
+            if let Err(rollback_error) = credentials::restore(existing.as_ref()) {
+                message.push_str(&format!(
+                    "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
+                ));
+            }
         }
         return Err(message);
     } else {
@@ -311,7 +323,7 @@ pub fn save_settings(
             registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
             settings::restore_snapshot(&registry_snapshot),
         );
-        let credential_rollback = credentials::restore(existing.as_ref());
+        let credential_rollback = wrote_credential.then(|| credentials::restore(existing.as_ref()));
         let mut message = error;
         if registered_for_save {
             if let Err(rollback_error) = app.global_shortcut().unregister(shortcut) {
@@ -325,7 +337,7 @@ pub fn save_settings(
                 "\nアプリ設定を変更前の状態へ戻せませんでした: {rollback_error}"
             ));
         }
-        if let Err(rollback_error) = credential_rollback {
+        if let Some(Err(rollback_error)) = credential_rollback {
             message.push_str(&format!(
                 "\nWindows資格情報を変更前の状態へ戻せませんでした: {rollback_error}"
             ));
@@ -348,6 +360,11 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let download_dir = app.path().document_dir()?.join("cwf_downloads");
     let loaded = migration::load_or_migrate()?;
     let settings = loaded.settings;
+    registry_support::report_io(
+        "SAML既定設定の保存",
+        registry_support::SETTINGS_REGISTRY_DISPLAY_PATH,
+        settings::write_missing_saml_defaults(&settings),
+    )?;
     let state = Arc::new(AppState {
         settings: RwLock::new(settings),
         cache_root,
@@ -408,9 +425,18 @@ mod tests {
 
     #[test]
     fn normalizes_and_validates_credential_ids() {
-        assert_eq!(normalize_id("  USER  ".to_owned()).expect("ID"), "USER");
-        assert!(normalize_id("  ".to_owned()).unwrap_err().contains("ID"));
-        assert!(normalize_id("USER\u{0007}".to_owned())
+        assert_eq!(
+            normalize_id("  USER  ".to_owned(), false).expect("ID"),
+            Some("USER".to_owned())
+        );
+        assert!(normalize_id("  ".to_owned(), false)
+            .unwrap_err()
+            .contains("ID"));
+        assert_eq!(
+            normalize_id("  ".to_owned(), true).expect("optional SAML ID"),
+            None
+        );
+        assert!(normalize_id("USER\u{0007}".to_owned(), true)
             .unwrap_err()
             .contains("制御文字"));
     }

@@ -244,6 +244,43 @@ pub fn write(settings: &Settings) -> io::Result<()> {
     write_at(REGISTRY_PATH, settings)
 }
 
+fn value_is_missing(key: &RegKey, name: &str) -> io::Result<bool> {
+    match key.get_raw_value(name) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// SAMLで初期設定画面を省略するとき、未登録の利用者設定だけを既定値で補う。
+///
+/// 旧Electron版の移行後に呼ぶことで、移行値やGPO配布値を上書きしない。
+fn write_missing_saml_defaults_at(path: &str, settings: &Settings) -> io::Result<bool> {
+    if !settings.use_saml_auth || settings.cwf_address.is_empty() {
+        return Ok(false);
+    }
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = hkcu.open_subkey_with_flags(path, KEY_READ | KEY_WRITE)?;
+    let mut wrote = false;
+    if value_is_missing(&key, VALUE_INTERVAL_MINUTES)? {
+        key.set_value(VALUE_INTERVAL_MINUTES, &settings.interval_minutes)?;
+        wrote = true;
+    }
+    if value_is_missing(&key, VALUE_NOTIFY_BY_BAR)? {
+        key.set_value(VALUE_NOTIFY_BY_BAR, &(settings.notify_by_bar as u32))?;
+        wrote = true;
+    }
+    if value_is_missing(&key, VALUE_SHORTCUT)? {
+        key.set_value(VALUE_SHORTCUT, &settings.shortcut)?;
+        wrote = true;
+    }
+    Ok(wrote)
+}
+
+pub fn write_missing_saml_defaults(settings: &Settings) -> io::Result<bool> {
+    write_missing_saml_defaults_at(REGISTRY_PATH, settings)
+}
+
 /// 保存した値をレジストリから読み直し、期待値と完全に一致するか調べる。
 pub fn verify(expected: &Settings) -> io::Result<bool> {
     Ok(read()?.as_ref() == Some(expected))
@@ -313,8 +350,8 @@ pub fn restore_snapshot(snapshot: &RegistrySnapshot) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        migration_version_completed, restore_snapshot_at, snapshot_at, write_at, Settings,
-        MAX_INTERVAL_MINUTES, SETTINGS_VALUE_NAMES,
+        migration_version_completed, restore_snapshot_at, snapshot_at, write_at,
+        write_missing_saml_defaults_at, Settings, MAX_INTERVAL_MINUTES, SETTINGS_VALUE_NAMES,
     };
     use std::time::SystemTime;
     use winreg::{
@@ -444,6 +481,62 @@ mod tests {
         assert!(
             unmanaged.is_empty(),
             "write_at wrote values missing from SETTINGS_VALUE_NAMES: {unmanaged:?}"
+        );
+        drop(key);
+        hkcu.delete_subkey_all(&path).expect("remove test key");
+        let _ = hkcu.delete_subkey(test_root);
+    }
+
+    #[test]
+    fn fills_only_missing_saml_defaults_after_migration() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let test_root = r"Software\KashiharaCity\CwfCheckerTests";
+        let path = format!(r"{test_root}\saml-defaults-{}-{nonce}", std::process::id());
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu
+            .create_subkey_with_flags(&path, KEY_READ | KEY_WRITE)
+            .expect("create test key");
+        assert!(!write_missing_saml_defaults_at(&path, &Settings::default())
+            .expect("normal authentication is unchanged"));
+        key.set_value("IntervalMinutes", &30_u32)
+            .expect("set migrated interval");
+        key.set_value("Unmanaged", &"keep")
+            .expect("set unmanaged value");
+        drop(key);
+        let settings = Settings {
+            cwf_address: "https://workflow.example/XFV20/".to_owned(),
+            use_saml_auth: true,
+            ..Settings::default()
+        };
+
+        assert!(write_missing_saml_defaults_at(&path, &settings).expect("write missing defaults"));
+        assert!(!write_missing_saml_defaults_at(&path, &settings).expect("second write is a no-op"));
+
+        let key = hkcu
+            .open_subkey_with_flags(&path, KEY_READ)
+            .expect("open test key");
+        assert_eq!(
+            key.get_value::<u32, _>("IntervalMinutes")
+                .expect("preserved migrated interval"),
+            30
+        );
+        assert_eq!(
+            key.get_value::<u32, _>("NotifyByBar")
+                .expect("default notification"),
+            0
+        );
+        assert_eq!(
+            key.get_value::<String, _>("Shortcut")
+                .expect("default shortcut"),
+            "F3"
+        );
+        assert_eq!(
+            key.get_value::<String, _>("Unmanaged")
+                .expect("unmanaged value"),
+            "keep"
         );
         drop(key);
         hkcu.delete_subkey_all(&path).expect("remove test key");
