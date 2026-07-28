@@ -3,7 +3,9 @@ param(
     [string] $ManifestPath,
 
     [ValidateRange(1, 30)]
-    [int] $MinimumAgeDays = 3
+    [int] $MinimumAgeDays = 3,
+
+    [switch] $Resolve
 )
 
 $ErrorActionPreference = "Stop"
@@ -164,6 +166,16 @@ for ($attempt = 1; $attempt -le $maximumResolutionAttempts; $attempt++) {
     if (-not $recentPackage) {
         Write-Host "All locked crates.io packages have been public for at least $MinimumAgeDays full days."
         exit 0
+    }
+
+    if (-not $Resolve) {
+        throw (
+            "{0}@{1} has not been public for {2} full days. " +
+            "Run this script locally with -Resolve, review and commit Cargo.lock, then retry." -f
+            $recentPackage.Name,
+            $recentPackage.Version,
+            $MinimumAgeDays
+        )
     }
 
     Write-Warning (

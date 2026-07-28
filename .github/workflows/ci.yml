@@ -1,0 +1,115 @@
+name: Continuous integration
+
+on:
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - ".github/scripts/**"
+      - ".github/workflows/**"
+      - "src-tauri/**"
+      - "web/**"
+      - "rust-toolchain.toml"
+  push:
+    branches:
+      - main
+    paths:
+      - ".cargo/**"
+      - ".github/scripts/**"
+      - ".github/workflows/**"
+      - "src-tauri/**"
+      - "web/**"
+      - "rust-toolchain.toml"
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check Windows application
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version
+
+      - name: Populate Cargo sparse-index cache
+        shell: pwsh
+        run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Verify three-day dependency cooldown
+        shell: pwsh
+        run: |
+          ./.github/scripts/resolve-cargo-cooldown.ps1 `
+            -ManifestPath src-tauri/Cargo.toml `
+            -MinimumAgeDays 3
+
+      - name: Verify Cargo.lock was not modified
+        shell: pwsh
+        run: |
+          $changes = @(git status --porcelain -- src-tauri/Cargo.lock)
+          if ($changes.Count -gt 0) {
+            throw "Cargo.lock must be resolved and committed before CI builds."
+          }
+
+      - name: Install cargo-audit
+        shell: pwsh
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit locked dependencies
+        shell: pwsh
+        run: |
+          $auditLines = @(cargo audit --file src-tauri/Cargo.lock --json)
+          $auditExitCode = $LASTEXITCODE
+          "## Dependency audit" >> $env:GITHUB_STEP_SUMMARY
+          if ($auditExitCode -eq 0) {
+            "✅ ``cargo audit`` found no known vulnerabilities." >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            $auditLines -join "`n" | Write-Host
+            "❌ ``cargo audit`` failed. See the workflow log for the JSON report." >> $env:GITHUB_STEP_SUMMARY
+          }
+          "" >> $env:GITHUB_STEP_SUMMARY
+          "<details><summary>cargo audit JSON</summary>" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          '```json' >> $env:GITHUB_STEP_SUMMARY
+          $auditLines >> $env:GITHUB_STEP_SUMMARY
+          '```' >> $env:GITHUB_STEP_SUMMARY
+          "</details>" >> $env:GITHUB_STEP_SUMMARY
+
+          if ($auditExitCode -ne 0) {
+            throw "cargo audit failed with exit code $auditExitCode."
+          }
+
+      - name: Build locked application
+        shell: pwsh
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Check formatting
+        shell: pwsh
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Run Clippy
+        shell: pwsh
+        run: |
+          cargo clippy `
+            --locked `
+            --all-targets `
+            --manifest-path src-tauri/Cargo.toml `
+            -- `
+            -D warnings
+
+      - name: Run tests
+        shell: pwsh
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
