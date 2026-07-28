@@ -95,8 +95,6 @@ jobs:
             )
           }
 
-          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
-
       - name: Check formatting
         shell: pwsh
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
