@@ -106,26 +106,20 @@ jobs:
         shell: pwsh
         run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml
 
-      - name: Package executable
-        id: package
+      - name: Prepare release executable
+        id: release_asset
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $archiveName = "CreateWebFlowChecker-v$env:RELEASE_VERSION-windows-x64.zip"
-          $archivePath = Join-Path $env:RUNNER_TEMP $archiveName
-          Compress-Archive `
-            -LiteralPath "src-tauri/target/release/CreateWebFlowChecker.exe" `
-            -DestinationPath $archivePath `
-            -CompressionLevel Optimal
+          $executablePath = (Resolve-Path `
+            -LiteralPath "src-tauri/target/release/CreateWebFlowChecker.exe"
+          ).Path
+          $executableHash = (
+            Get-FileHash -LiteralPath $executablePath -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
 
-          $checksumName = "$archiveName.sha256"
-          $checksumPath = Join-Path $env:RUNNER_TEMP $checksumName
-          $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$archiveHash  $archiveName" |
-            Set-Content -LiteralPath $checksumPath -Encoding ascii
-
-          "archive_path=$archivePath" >> $env:GITHUB_OUTPUT
-          "checksum_path=$checksumPath" >> $env:GITHUB_OUTPUT
+          "executable_path=$executablePath" >> $env:GITHUB_OUTPUT
+          "executable_sha256=$executableHash" >> $env:GITHUB_OUTPUT
 
       - name: Create or update GitHub Release
         shell: pwsh
@@ -133,8 +127,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
           REPOSITORY: ${{ github.repository }}
-          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
-          CHECKSUM_PATH: ${{ steps.package.outputs.checksum_path }}
+          EXECUTABLE_PATH: ${{ steps.release_asset.outputs.executable_path }}
+          EXECUTABLE_SHA256: ${{ steps.release_asset.outputs.executable_sha256 }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
           $tag = $env:TAG_NAME
@@ -143,15 +137,13 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload `
               $tag `
-              $env:ARCHIVE_PATH `
-              $env:CHECKSUM_PATH `
+              $env:EXECUTABLE_PATH `
               --clobber `
               --repo $env:REPOSITORY
           } else {
             gh release create `
               $tag `
-              $env:ARCHIVE_PATH `
-              $env:CHECKSUM_PATH `
+              $env:EXECUTABLE_PATH `
               --verify-tag `
               --generate-notes `
               --title "CreateWebFlowChecker $tag" `
@@ -160,4 +152,41 @@ jobs:
 
           if ($LASTEXITCODE -ne 0) {
             throw "GitHub Release publication failed with exit code $LASTEXITCODE."
+          }
+
+          $bodyLines = @(
+            gh release view `
+              $tag `
+              --json body `
+              --jq ".body" `
+              --repo $env:REPOSITORY
+          )
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read the GitHub Release body."
+          }
+
+          $body = $bodyLines -join "`n"
+          $checksumPattern = '(?im)\r?\n*sha-?256:\s*`[0-9a-f]{64}`\s*$'
+          $bodyWithoutChecksum = [regex]::Replace(
+            $body,
+            $checksumPattern,
+            ""
+          ).TrimEnd()
+          $checksumLine = 'sha256: `' + $env:EXECUTABLE_SHA256 + '`'
+          $updatedBody = $checksumLine
+          if ($bodyWithoutChecksum) {
+            $updatedBody = "$bodyWithoutChecksum`n`n$checksumLine"
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          Set-Content `
+            -LiteralPath $notesPath `
+            -Value $updatedBody `
+            -Encoding utf8
+          gh release edit `
+            $tag `
+            --notes-file $notesPath `
+            --repo $env:REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not write the SHA-256 to the GitHub Release body."
           }
