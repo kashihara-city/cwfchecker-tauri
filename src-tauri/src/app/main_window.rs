@@ -64,6 +64,7 @@ fn handle_new_window(
     )
     .title(APP_TITLE)
     .window_features(features)
+    .maximized(true)
     .data_directory(state.cache_root.clone())
     .on_navigation(move |url| {
         url.as_str() == "about:blank" || has_allowed_origin(url, &decision_origin)
@@ -89,7 +90,6 @@ fn handle_new_window(
     match decision.build() {
         Ok(window) => {
             state.decisions.fetch_add(1, Ordering::Relaxed);
-            let _ = window.maximize();
             NewWindowResponse::Create { window }
         }
         Err(_) => NewWindowResponse::Deny,
