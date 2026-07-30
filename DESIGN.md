@@ -10,4 +10,14 @@
 - WebView2のユーザーデータは一時ディレクトリに置き、次回起動時に削除する。
 - 永続ログ、自動更新、TLS検証無効化は行わない。認証情報はURLやログへ出さず、
   公式ポートレット仕様のPOST本文で送信する。
+- `withGlobalTauri` はIPCの認可設定ではなく、公開JavaScript API一式を
+  `window.__TAURI__` に載せる設定である。無効でもTauri 2.11.5のWindows実装では
+  `window.__TAURI_INTERNALS__` とIPC機構が各documentへ注入され、CWFへの遷移後も
+  利用可能な形で存在する。ただし`window.__TAURI_INTERNALS__`は公開APIではなく、
+  長期互換性を前提にできないため、これを設定画面から直接呼ぶことで
+  `withGlobalTauri`を無効化しない。npm・JavaScriptパッケージを使わない方針のもと、
+  設定画面は公開APIの`window.__TAURI__`を使うため`withGlobalTauri`を有効にする。
+  CWFのリモートoriginにはremote capabilityを付与しないため、IPC要求はRustコマンドへ
+  到達する前にRuntime Authorityが拒否する。設定コマンドでもウィンドウラベルを検査し、
+  この認可に依存しない多層防御を維持する。
 - Cargo依存は公開後3日経過を確認し、`cargo audit` 後に `--locked` でビルドする。
