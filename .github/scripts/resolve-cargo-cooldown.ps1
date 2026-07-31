@@ -135,6 +135,25 @@ function Invoke-Cargo {
     }
 }
 
+function ConvertTo-PublicationTime {
+    param([Parameter(Mandatory = $true)] $Value)
+
+    # PowerShellはISO 8601文字列をConvertFrom-Json時にDateTimeへ変換する。
+    # それを文字列として再Parseすると実行環境のタイムゾーンが混入するため、
+    # DateTimeのKindを保ったままDateTimeOffsetへ変換する。
+    if ($Value -is [DateTimeOffset]) {
+        return $Value
+    }
+    if ($Value -is [DateTime]) {
+        return [DateTimeOffset]::new($Value.ToUniversalTime())
+    }
+    return [DateTimeOffset]::Parse(
+        $Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AssumeUniversal
+    )
+}
+
 function Test-CompatibleVersionBand {
     param(
         [Parameter(Mandatory = $true)]
@@ -170,10 +189,7 @@ function Get-RecentPackages {
             throw "Publication timestamp not found for $($package.Name)@$($package.Version)."
         }
 
-        $publicationTime = [DateTimeOffset]::Parse(
-            $lockedRecord.pubtime,
-            [Globalization.CultureInfo]::InvariantCulture
-        )
+        $publicationTime = ConvertTo-PublicationTime -Value $lockedRecord.pubtime
         if ($publicationTime -le $cutoff) {
             continue
         }
@@ -207,10 +223,7 @@ function Get-EligibleCandidates {
             Where-Object {
                 $candidateVersion = [System.Management.Automation.SemanticVersion]::new($_.vers)
                 -not $_.yanked -and
-                ([DateTimeOffset]::Parse(
-                    $_.pubtime,
-                    [Globalization.CultureInfo]::InvariantCulture
-                ) -le $cutoff) -and
+                ((ConvertTo-PublicationTime -Value $_.pubtime) -le $cutoff) -and
                 ($candidateVersion -lt $currentVersion) -and
                 (Test-CompatibleVersionBand `
                     -Current $currentVersion `
