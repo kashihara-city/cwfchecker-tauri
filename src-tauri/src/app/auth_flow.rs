@@ -644,6 +644,8 @@ mod tests {
         assert!(script.contains("sessionStorage"));
         assert!(script.contains("window.__cwfScanRunning || window.__cwfScanReported"));
         assert!(script.contains("window.__cwfScanReported = true;"));
+        assert!(script.contains("a[href*=\"/XFV20/receive/spf/approve_form\"]"));
+        assert!(!script.contains("anchor anchor-primary"));
         assert!(script.contains("root.style.overflowY = \"hidden\""));
         assert!(reload_script.contains("\"42\""));
         assert!(reload_script.contains("window.location.reload()"));

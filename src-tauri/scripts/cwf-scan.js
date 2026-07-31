@@ -40,9 +40,11 @@
     if (!document.body || window.__cwfScanRunning || window.__cwfScanReported) return;
     window.__cwfScanRunning = true;
     try {
-      // 旧Electron版と同じ目印を数え、処理待ち件数と認証成功を判定する。
+      // 実際の承認フォームへのリンクを数え、描画行数と案件の有無を判定する。
       const html = document.body.innerHTML;
-      const decisionCount = countMatches(html, "anchor anchor-primary");
+      const decisionCount = document.querySelectorAll(
+        'a[href*="/XFV20/receive/spf/approve_form"]'
+      ).length;
       const authCount = countMatches(html, "<!-- 認証成功 -->");
       const countText = document.querySelector("ul.form-list_h span.dummy")?.textContent?.trim() || "0";
       const baseUrl = window.location.href.split("XFV20")[0];
