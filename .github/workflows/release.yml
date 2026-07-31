@@ -112,7 +112,7 @@ jobs:
         run: |
           ./.github/scripts/resolve-cargo-cooldown.ps1 `
             -ManifestPath src-tauri/Cargo.toml `
-            -MinimumAgeDays 3
+            -MinimumAgeDays 14
 
       - name: Verify release inputs were not modified
         shell: pwsh

@@ -3,7 +3,7 @@ param(
     [string] $ManifestPath,
 
     [ValidateRange(1, 30)]
-    [int] $MinimumAgeDays = 3,
+    [int] $MinimumAgeDays = 14,
 
     [switch] $Resolve
 )
@@ -135,12 +135,32 @@ function Invoke-Cargo {
     }
 }
 
-$maximumResolutionAttempts = 100
-for ($attempt = 1; $attempt -le $maximumResolutionAttempts; $attempt++) {
-    $recentPackage = $null
-    $recentPackageVersions = $null
+function Test-CompatibleVersionBand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.SemanticVersion] $Current,
+
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.SemanticVersion] $Candidate
+    )
+
+    if ($Current.Major -gt 0) {
+        return $Candidate.Major -eq $Current.Major
+    }
+    if ($Current.Minor -gt 0) {
+        return $Candidate.Major -eq 0 -and $Candidate.Minor -eq $Current.Minor
+    }
+    return $Candidate.Major -eq 0 -and
+        $Candidate.Minor -eq 0 -and
+        $Candidate.Patch -eq $Current.Patch
+}
+
+function Get-RecentPackages {
+    $recentPackages = @()
+    $checkedCount = 0
 
     foreach ($package in (Get-LockedCratesIoPackages)) {
+        $checkedCount++
         $availableVersions = @(Get-SparseVersions -CrateName $package.Name)
         $lockedRecord = $availableVersions |
             Where-Object { $_.vers -eq $package.Version } |
@@ -154,58 +174,47 @@ for ($attempt = 1; $attempt -le $maximumResolutionAttempts; $attempt++) {
             $lockedRecord.pubtime,
             [Globalization.CultureInfo]::InvariantCulture
         )
+        if ($publicationTime -le $cutoff) {
+            continue
+        }
+
         $age = [DateTimeOffset]::UtcNow - $publicationTime
         Write-Host (
-            "Checked {0}@{1}: published {2:u}, age {3:N2} days" -f
+            "Cooldown pending: {0}@{1}, published {2:u}, age {3:N2} days" -f
             $package.Name,
             $package.Version,
             $publicationTime,
             $age.TotalDays
         )
-
-        if ($publicationTime -gt $cutoff) {
-            $recentPackage = $package
-            $recentPackageVersions = $availableVersions
-            break
+        $recentPackages += [pscustomobject]@{
+            Package = $package
+            AvailableVersions = $availableVersions
         }
     }
 
-    if (-not $recentPackage) {
-        Write-Host "All locked crates.io packages have been public for at least $MinimumAgeDays full days."
-        exit 0
-    }
+    Write-Host "Checked $checkedCount locked crates.io package entries."
+    return $recentPackages
+}
 
-    if (-not $Resolve) {
-        throw (
-            (
-                "{0}@{1} has not been public for {2} full days. " +
-                "Run this script locally with -Resolve, review and commit Cargo.lock, then retry."
-            ) -f
-            $recentPackage.Name,
-            $recentPackage.Version,
-            $MinimumAgeDays
-        )
-    }
+function Get-EligibleCandidates {
+    param([Parameter(Mandatory = $true)] $RecentPackage)
 
-    Write-Warning (
-        "{0}@{1} is newer than the cutoff {2:u}; searching for the newest compatible older version." -f
-        $recentPackage.Name,
-        $recentPackage.Version,
-        $cutoff
+    $currentVersion = [System.Management.Automation.SemanticVersion]::new(
+        $RecentPackage.Package.Version
     )
-
-    $currentSemanticVersion = [System.Management.Automation.SemanticVersion]::new(
-        $recentPackage.Version
-    )
-    $candidates = @(
-        $recentPackageVersions |
+    return @(
+        $RecentPackage.AvailableVersions |
             Where-Object {
+                $candidateVersion = [System.Management.Automation.SemanticVersion]::new($_.vers)
                 -not $_.yanked -and
                 ([DateTimeOffset]::Parse(
                     $_.pubtime,
                     [Globalization.CultureInfo]::InvariantCulture
                 ) -le $cutoff) -and
-                ([System.Management.Automation.SemanticVersion]::new($_.vers) -lt $currentSemanticVersion)
+                ($candidateVersion -lt $currentVersion) -and
+                (Test-CompatibleVersionBand `
+                    -Current $currentVersion `
+                    -Candidate $candidateVersion)
             } |
             ForEach-Object {
                 [pscustomobject]@{
@@ -215,24 +224,80 @@ for ($attempt = 1; $attempt -le $maximumResolutionAttempts; $attempt++) {
             } |
             Sort-Object SemanticVersion -Descending
     )
+}
+
+$maximumResolutionAttempts = 100
+for ($attempt = 1; $attempt -le $maximumResolutionAttempts; $attempt++) {
+    $recentPackages = @(Get-RecentPackages)
+    if ($recentPackages.Count -eq 0) {
+        Write-Host "All locked crates.io packages have been public for at least $MinimumAgeDays full days."
+        exit 0
+    }
+
+    if (-not $Resolve) {
+        $first = $recentPackages[0].Package
+        throw (
+            (
+                "{0} locked package entries have not been public for {1} full days; " +
+                "the first is {2}@{3}. Run this script locally with -Resolve, " +
+                "review and commit Cargo.lock, then retry."
+            ) -f
+            $recentPackages.Count,
+            $MinimumAgeDays,
+            $first.Name,
+            $first.Version
+        )
+    }
+
+    $candidateLists = @($recentPackages | ForEach-Object {
+        [pscustomobject]@{
+            RecentPackage = $_
+            Candidates = @(Get-EligibleCandidates -RecentPackage $_)
+        }
+    })
+    $maximumCandidateCount = ($candidateLists |
+        ForEach-Object { $_.Candidates.Count } |
+        Measure-Object -Maximum).Maximum
+    if (-not $maximumCandidateCount) {
+        throw "No cooldown-eligible versions are available for the recent locked packages."
+    }
 
     $resolved = $false
-    foreach ($candidate in $candidates) {
-        Write-Host (
-            "Trying cargo update -p {0}@{1} --precise {2}" -f
-            $recentPackage.Name,
-            $recentPackage.Version,
-            $candidate.Version
-        )
+    for ($candidateIndex = 0; $candidateIndex -lt $maximumCandidateCount; $candidateIndex++) {
+        foreach ($candidateList in $candidateLists) {
+            if ($candidateIndex -ge $candidateList.Candidates.Count) {
+                continue
+            }
 
-        & cargo update `
-            --manifest-path $resolvedManifestPath `
-            -p "$($recentPackage.Name)@$($recentPackage.Version)" `
-            --precise $candidate.Version
-
-        if ($LASTEXITCODE -eq 0) {
+            $recentPackage = $candidateList.RecentPackage.Package
+            $candidate = $candidateList.Candidates[$candidateIndex]
+            $lockSnapshot = [IO.File]::ReadAllBytes($lockPath)
             Write-Host (
-                "Downgraded {0}@{1} to the newest compatible eligible version, {2}." -f
+                "Trying cargo update -p {0}@{1} --precise {2}" -f
+                $recentPackage.Name,
+                $recentPackage.Version,
+                $candidate.Version
+            )
+            $cargoOutput = @(
+                & cargo update `
+                    --manifest-path $resolvedManifestPath `
+                    -p "$($recentPackage.Name)@$($recentPackage.Version)" `
+                    --precise $candidate.Version 2>&1
+            )
+
+            if ($LASTEXITCODE -ne 0) {
+                [IO.File]::WriteAllBytes($lockPath, $lockSnapshot)
+                Write-Host (
+                    "Deferred {0}@{1}; another recent dependency may need to move first." -f
+                    $recentPackage.Name,
+                    $recentPackage.Version
+                )
+                continue
+            }
+
+            $cargoOutput | Write-Host
+            Write-Host (
+                "Resolved {0}@{1} to cooldown-eligible version {2}." -f
                 $recentPackage.Name,
                 $recentPackage.Version,
                 $candidate.Version
@@ -246,15 +311,19 @@ for ($attempt = 1; $attempt -le $maximumResolutionAttempts; $attempt++) {
             $resolved = $true
             break
         }
+        if ($resolved) {
+            break
+        }
     }
 
     if (-not $resolved) {
+        $blocked = $recentPackages |
+            ForEach-Object { "$($_.Package.Name)@$($_.Package.Version)" }
         throw (
-            "No compatible version of {0} older than {1:u} could be resolved. Build stopped." -f
-            $recentPackage.Name,
-            $cutoff
+            "No cooldown-eligible dependency update could be resolved. " +
+            "Blocked packages: $($blocked -join ', ')"
         )
     }
 }
 
-throw "Dependency cooldown resolution exceeded $maximumResolutionAttempts attempts."
+throw "Dependency cooldown resolution exceeded $maximumResolutionAttempts successful updates."
