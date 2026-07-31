@@ -1,3 +1,5 @@
+/* CWFページへ初期化時に注入し、DOM調査、フッター追加、Rustへの結果報告を行う。
+ * Rust側が生成したconfigとcwf-scan-core.jsを前提にWebView内で実行される。 */
 (config) => {
   // iframeや想定外サーバーでは、ページ内容の読取りやRust側への報告を行わない。
   if (window.top !== window || window.location.origin !== config.allowedOrigin) return;
@@ -24,8 +26,6 @@
     "cwfchecker_footer02.png", "cwfchecker_footer03.png",
     "cwfchecker_footer04.png", "cwfchecker_footer05.png"
   ];
-  const countMatches = (source, needle) =>
-    needle ? (source.match(new RegExp(needle, "g")) || []).length : 0;
   const checkImage = (url) => new Promise((resolve) => {
     const image = new Image();
     // ポートレットURLの認証クエリを画像リクエストのRefererへ載せない。
@@ -41,12 +41,8 @@
     window.__cwfScanRunning = true;
     try {
       // 実際の承認フォームへのリンクを数え、描画行数と案件の有無を判定する。
-      const html = document.body.innerHTML;
-      const decisionCount = document.querySelectorAll(
-        'a[href*="/XFV20/receive/spf/approve_form"]'
-      ).length;
-      const authCount = countMatches(html, "<!-- 認証成功 -->");
-      const countText = document.querySelector("ul.form-list_h span.dummy")?.textContent?.trim() || "0";
+      const { decisionCount, authCount, countText } =
+        window.__cwfScanCore.scanCwfDocument(document);
       const baseUrl = window.location.href.split("XFV20")[0];
       const images = (await Promise.all(imageCandidates.map(
         name => checkImage(`${baseUrl}XFV20/manual/user/_images/${name}`)

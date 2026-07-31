@@ -1,3 +1,5 @@
+/* ローカルbootstrapページ上で認証フォームを組み立て、CWFへPOSTする。
+ * ID/PWを静的HTMLやURLへ残さず、Rustから渡されたconfigだけを使用する。 */
 (config) => {
   if (window.location.href !== config.bootstrapUrl) return;
 

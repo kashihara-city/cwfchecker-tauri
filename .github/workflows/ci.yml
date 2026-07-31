@@ -89,6 +89,10 @@ jobs:
         shell: pwsh
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
+      - name: Check and test JavaScript
+        shell: pwsh
+        run: ./.github/scripts/test-javascript.ps1
+
       - name: Run Clippy
         shell: pwsh
         run: |

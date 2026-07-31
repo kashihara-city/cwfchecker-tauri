@@ -99,6 +99,10 @@ jobs:
         shell: pwsh
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
+      - name: Check and test JavaScript
+        shell: pwsh
+        run: ./.github/scripts/test-javascript.ps1
+
       - name: Populate Cargo sparse-index cache
         shell: pwsh
         run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml

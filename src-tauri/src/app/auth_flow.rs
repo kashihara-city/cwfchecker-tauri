@@ -26,6 +26,7 @@ const RELOAD_FALLBACK_DELAY: Duration = Duration::from_secs(5);
 const LOAD_GENERATION_PREFIX: &str = "__CWFCHECKER_LOAD__";
 const LOAD_GENERATION_STORAGE_KEY: &str = "__cwfcheckerLoadGeneration";
 const PORTLET_POST_SCRIPT: &str = include_str!("../../scripts/portlet-post.js");
+const WEBVIEW_CORE_SCRIPT: &str = include_str!("../../scripts/cwf-scan-core.js");
 const WEBVIEW_SCRIPT: &str = include_str!("../../scripts/cwf-scan.js");
 const SAML_POST_VALUE: &str = "SAML";
 const MAIN_WINDOW_LOGICAL_WIDTH: f64 = 600.0;
@@ -405,7 +406,7 @@ pub(super) fn webview_script(origin: &str) -> String {
         "generationPrefix": LOAD_GENERATION_PREFIX,
         "generationStorageKey": LOAD_GENERATION_STORAGE_KEY,
     });
-    format!("({WEBVIEW_SCRIPT})({config});")
+    format!("{WEBVIEW_CORE_SCRIPT}\n({WEBVIEW_SCRIPT})({config});")
 }
 
 #[derive(Debug)]
@@ -644,7 +645,8 @@ mod tests {
         assert!(script.contains("sessionStorage"));
         assert!(script.contains("window.__cwfScanRunning || window.__cwfScanReported"));
         assert!(script.contains("window.__cwfScanReported = true;"));
-        assert!(script.contains("a[href*=\"/XFV20/receive/spf/approve_form\"]"));
+        assert!(script.contains("/XFV20/receive/spf/approve_form"));
+        assert!(script.contains("window.__cwfScanCore.scanCwfDocument(document)"));
         assert!(!script.contains("anchor anchor-primary"));
         assert!(script.contains("root.style.overflowY = \"hidden\""));
         assert!(reload_script.contains("\"42\""));
