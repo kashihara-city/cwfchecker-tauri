@@ -86,8 +86,10 @@ test("recognizes direct and JavaScript decision links", () => {
     isDecisionHref("/XFV20/receive/spf/confirm_form?fixture=other-type"),
     true
   );
+  assert.equal(isDecisionHref("/XFV20/receive/spf/approve_form/12345"), true);
   assert.equal(isDecisionHref("/XFV20/receive/spf/list"), false);
   assert.equal(isDecisionHref("/XFV20/receive/spf/foo_form_extra"), false);
+  assert.equal(isDecisionHref("/XFV20/receive/spf/approve_form.do"), false);
   assert.equal(isDecisionHref("/XFV20/receive/other/foo_form"), false);
   assert.equal(isDecisionHref(null), false);
 });

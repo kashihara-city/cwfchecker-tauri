@@ -2,7 +2,7 @@
  * WebViewのcwf-scan.jsとNodeのfixtureテストの両方から使用する。 */
 () => {
   const DECISION_PATH_PATTERN =
-    /\/XFV20\/receive\/spf\/[^/?#'"()\s<>]+_form(?=[?#'"()\s<>]|$)/i;
+    /\/XFV20\/receive\/spf\/[^/?#'"()\s<>]+_form(?![^/?#'"()\s<>])/i;
   const AUTH_SUCCESS_MARKER = "<!-- 認証成功 -->";
 
   const countOccurrences = (source, needle) =>
