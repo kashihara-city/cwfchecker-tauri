@@ -105,7 +105,7 @@ fn lock_error() -> String {
     "アプリの共有状態のロックに失敗しました。".to_owned()
 }
 
-/// `withGlobalTauri`はリモートのCWF画面にもIPCブリッジを公開する。
+/// `withGlobalTauri`は公開JavaScript APIの設定であり、IPC機構自体は各documentへ注入される。
 ///
 /// capabilityだけでなく、すべてのTauriコマンドでこの検査を行い、
 /// 同梱した設定画面以外からアプリ定義コマンドを呼べない状態を維持する。

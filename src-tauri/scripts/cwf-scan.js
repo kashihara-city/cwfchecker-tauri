@@ -1,8 +1,22 @@
 /* CWFページへ初期化時に注入し、DOM調査、フッター追加、Rustへの結果報告を行う。
- * Rust側が生成したconfigとcwf-scan-core.jsを前提にWebView内で実行される。 */
-(config) => {
+ * Rust側が生成したconfigとDOM調査コアのファクトリを受け取って実行される。 */
+(config, createCwfScanCore) => {
   // iframeや想定外サーバーでは、ページ内容の読取りやRust側への報告を行わない。
   if (window.top !== window || window.location.origin !== config.allowedOrigin) return;
+
+  let cwfScanCore;
+  try {
+    if (typeof createCwfScanCore !== "function") {
+      throw new TypeError("DOM調査コアのファクトリがありません。");
+    }
+    cwfScanCore = createCwfScanCore();
+    if (typeof cwfScanCore?.scanCwfDocument !== "function") {
+      throw new TypeError("DOM調査コアを初期化できませんでした。");
+    }
+  } catch (error) {
+    console.error("CWF DOM調査コアの初期化に失敗しました:", error);
+    return;
+  }
 
   // 文書生成時の世代を固定する。次のreloadがwindow.nameを書き換えた後に
   // この文書の非同期スキャンが完了しても、新しい世代を誤って名乗らない。
@@ -42,7 +56,7 @@
     try {
       // 実際の承認フォームへのリンクを数え、描画行数と案件の有無を判定する。
       const { decisionCount, authCount, countText } =
-        window.__cwfScanCore.scanCwfDocument(document);
+        cwfScanCore.scanCwfDocument(document);
       const baseUrl = window.location.href.split("XFV20")[0];
       const images = (await Promise.all(imageCandidates.map(
         name => checkImage(`${baseUrl}XFV20/manual/user/_images/${name}`)
@@ -93,6 +107,8 @@
       document.title = `__CWFCHECKER_REPORT__|${loadGeneration}|${decisionCount}|${authCount}|${images.length}|${contentHeight}|${countText.replaceAll("|", "")}`;
       await new Promise(resolve => setTimeout(resolve, 0));
       document.title = previousTitle;
+    } catch (error) {
+      console.error("CWFページのDOM調査に失敗しました:", error);
     } finally {
       window.__cwfScanRunning = false;
     }

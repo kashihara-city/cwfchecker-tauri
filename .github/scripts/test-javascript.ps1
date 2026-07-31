@@ -1,4 +1,5 @@
 $ErrorActionPreference = "Stop"
+$PSNativeCommandUseErrorActionPreference = $false
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $javascriptRoots = @(
@@ -7,7 +8,7 @@ $javascriptRoots = @(
     (Join-Path $repositoryRoot "tests\javascript")
 )
 $javascriptFiles = @(
-    Get-ChildItem -LiteralPath $javascriptRoots -Filter "*.js" -File
+    Get-ChildItem -LiteralPath $javascriptRoots -Filter "*.js" -File -Recurse
 )
 if ($javascriptFiles.Count -eq 0) {
     throw "JavaScript files were not found."

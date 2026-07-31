@@ -10,7 +10,7 @@
 - WebView2のユーザーデータは一時ディレクトリに置き、次回起動時に削除する。
 - 永続ログ、自動更新、TLS検証無効化は行わない。認証情報はURLやログへ出さず、
   公式ポートレット仕様のPOST本文で送信する。
-- Cargo依存は公開後14日経過を確認し、`cargo audit` 後に `--locked` でビルドする。
+- Windows向け解決グラフのCargo依存は公開後7日経過を確認し、`cargo audit` 後に `--locked` でビルドする。
 - JavaScriptはActionsで構文・単体テストを行い、実画面由来の4 HTML fixtureでDOM判定を検証する。
 - `withGlobalTauri` はIPCの認可設定ではなく、公開JavaScript API一式を
   `window.__TAURI__` に載せる設定である。無効でもTauri 2.11.5のWindows実装では

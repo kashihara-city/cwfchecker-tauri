@@ -1,15 +1,15 @@
-/* CWFポートレットの認証マーカー、案件リンク、通知用件数をDOMから抽出する共有処理。
+/* CWFポートレットの認証マーカー、案件リンク、通知用件数をDOMから抽出するファクトリ。
  * WebViewのcwf-scan.jsとNodeのfixtureテストの両方から使用する。 */
-(root => {
-  const DECISION_PATH = "/XFV20/receive/spf/approve_form";
+() => {
+  const DECISION_PATH_PATTERN =
+    /\/XFV20\/receive\/spf\/[^/?#'"()\s<>]+_form(?=[?#'"()\s<>]|$)/i;
   const AUTH_SUCCESS_MARKER = "<!-- 認証成功 -->";
-  const AUTH_FAILURE_MARKER = "<!-- 認証失敗 -->";
 
   const countOccurrences = (source, needle) =>
     needle ? source.split(needle).length - 1 : 0;
 
   const isDecisionHref = href =>
-    typeof href === "string" && href.includes(DECISION_PATH);
+    typeof href === "string" && DECISION_PATH_PATTERN.test(href);
 
   const scanCwfDocument = document => {
     const html = document.body?.innerHTML || "";
@@ -22,19 +22,14 @@
     return {
       decisionCount,
       authCount: countOccurrences(html, AUTH_SUCCESS_MARKER),
-      authFailureCount: countOccurrences(html, AUTH_FAILURE_MARKER),
       countText,
     };
   };
 
-  const api = Object.freeze({
-    AUTH_FAILURE_MARKER,
+  return Object.freeze({
     AUTH_SUCCESS_MARKER,
-    DECISION_PATH,
+    DECISION_PATH_PATTERN,
     isDecisionHref,
     scanCwfDocument,
   });
-
-  root.__cwfScanCore = api;
-  if (typeof module === "object" && module.exports) module.exports = api;
-})(typeof globalThis === "object" ? globalThis : this);
+}

@@ -3,7 +3,9 @@ param(
     [string] $ManifestPath,
 
     [ValidateRange(1, 30)]
-    [int] $MinimumAgeDays = 14,
+    [int] $MinimumAgeDays = 7,
+
+    [string] $TargetTriple = "x86_64-pc-windows-msvc",
 
     [switch] $Resolve
 )
@@ -30,33 +32,39 @@ if ($env:CARGO_HOME) {
 $indexRoot = Join-Path $cargoDirectory "registry\index"
 
 function Get-LockedCratesIoPackages {
-    $lockContent = Get-Content -LiteralPath $lockPath -Raw
-    $blocks = [regex]::Split($lockContent, "(?m)(?=^\[\[package\]\]\s*$)")
-    $packages = @()
-
-    foreach ($block in $blocks) {
-        $nameMatch = [regex]::Match($block, '(?m)^name = "([^"]+)"\s*$')
-        $versionMatch = [regex]::Match($block, '(?m)^version = "([^"]+)"\s*$')
-        $sourceMatch = [regex]::Match($block, '(?m)^source = "([^"]+)"\s*$')
-
-        if (-not ($nameMatch.Success -and $versionMatch.Success -and $sourceMatch.Success)) {
-            continue
-        }
-
-        if ($sourceMatch.Groups[1].Value -notmatch 'crates\.io-index|index\.crates\.io') {
-            continue
-        }
-
-        $packages += [pscustomobject]@{
-            Name = $nameMatch.Groups[1].Value
-            Version = $versionMatch.Groups[1].Value
-        }
+    $metadataLines = @(
+        & cargo metadata `
+            --locked `
+            --filter-platform $TargetTriple `
+            --format-version 1 `
+            --manifest-path $resolvedManifestPath
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo metadata failed while resolving target '$TargetTriple'."
     }
+    $metadata = ($metadataLines -join "`n") | ConvertFrom-Json
+    $resolvedIds = @{}
+    foreach ($node in $metadata.resolve.nodes) {
+        $resolvedIds[[string]$node.id] = $true
+    }
+    $packages = @(
+        $metadata.packages |
+            Where-Object {
+                $resolvedIds.ContainsKey([string]$_.id) -and
+                $_.source -match 'crates\.io-index|index\.crates\.io'
+            } |
+            ForEach-Object {
+                [pscustomobject]@{
+                    Name = $_.name
+                    Version = $_.version
+                }
+            }
+    )
 
     if ($packages.Count -eq 0) {
         throw (
-            "No crates.io packages were found in $lockPath. " +
-            "The lockfile format may have changed; cooldown was NOT verified."
+            "No crates.io packages were found in the '$TargetTriple' resolve graph. " +
+            "Dependency cooldown was NOT verified."
         )
     }
 
@@ -208,7 +216,7 @@ function Get-RecentPackages {
         }
     }
 
-    Write-Host "Checked $checkedCount locked crates.io package entries."
+    Write-Host "Checked $checkedCount crates.io package entries resolved for $TargetTriple."
     return $recentPackages
 }
 
@@ -300,6 +308,7 @@ for ($attempt = 1; $attempt -le $maximumResolutionAttempts; $attempt++) {
 
             if ($LASTEXITCODE -ne 0) {
                 [IO.File]::WriteAllBytes($lockPath, $lockSnapshot)
+                $cargoOutput | Write-Host
                 Write-Host (
                     "Deferred {0}@{1}; another recent dependency may need to move first." -f
                     $recentPackage.Name,

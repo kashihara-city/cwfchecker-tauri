@@ -35,12 +35,13 @@ jobs:
         shell: pwsh
         run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml
 
-      - name: Verify fourteen-day dependency cooldown
+      - name: Verify seven-day dependency cooldown
         shell: pwsh
         run: |
           ./.github/scripts/resolve-cargo-cooldown.ps1 `
             -ManifestPath src-tauri/Cargo.toml `
-            -MinimumAgeDays 14
+            -MinimumAgeDays 7 `
+            -TargetTriple x86_64-pc-windows-msvc
 
       - name: Verify Cargo.lock was not modified
         shell: pwsh

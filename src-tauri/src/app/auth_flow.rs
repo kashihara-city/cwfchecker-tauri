@@ -406,7 +406,7 @@ pub(super) fn webview_script(origin: &str) -> String {
         "generationPrefix": LOAD_GENERATION_PREFIX,
         "generationStorageKey": LOAD_GENERATION_STORAGE_KEY,
     });
-    format!("{WEBVIEW_CORE_SCRIPT}\n({WEBVIEW_SCRIPT})({config});")
+    format!("({WEBVIEW_SCRIPT})({config}, ({WEBVIEW_CORE_SCRIPT}));")
 }
 
 #[derive(Debug)]
@@ -645,8 +645,13 @@ mod tests {
         assert!(script.contains("sessionStorage"));
         assert!(script.contains("window.__cwfScanRunning || window.__cwfScanReported"));
         assert!(script.contains("window.__cwfScanReported = true;"));
-        assert!(script.contains("/XFV20/receive/spf/approve_form"));
-        assert!(script.contains("window.__cwfScanCore.scanCwfDocument(document)"));
+        assert!(script.contains("/XFV20\\/receive\\/spf\\/"));
+        assert!(script.contains("_form"));
+        assert!(!script.contains("/XFV20/receive/spf/approve_form"));
+        assert!(script.contains("(config, createCwfScanCore)"));
+        assert!(script.contains("cwfScanCore.scanCwfDocument(document)"));
+        assert!(script.contains("CWFページのDOM調査に失敗しました:"));
+        assert!(!script.contains("window.__cwfScanCore"));
         assert!(!script.contains("anchor anchor-primary"));
         assert!(script.contains("root.style.overflowY = \"hidden\""));
         assert!(reload_script.contains("\"42\""));
