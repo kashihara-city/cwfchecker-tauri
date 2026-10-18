@@ -44,7 +44,16 @@
     const image = new Image();
     // ポートレットURLの認証クエリを画像リクエストのRefererへ載せない。
     image.referrerPolicy = "no-referrer";
-    image.onload = image.onerror = () => resolve(image.naturalWidth > 0 ? url : null);
+    // 応答の止まった画像のために、認証・案件の報告まで止めない。
+    // 期限内に結果が出ない候補は「画像なし」として先へ進む。
+    const timeout = setTimeout(() => {
+      image.src = "";
+      resolve(null);
+    }, config.imageProbeTimeoutMs);
+    image.onload = image.onerror = () => {
+      clearTimeout(timeout);
+      resolve(image.naturalWidth > 0 ? url : null);
+    };
     image.src = url;
   });
 

@@ -23,6 +23,8 @@ const PORTLET_BOOTSTRAP_URL: &str = "http://tauri.localhost/portlet-bootstrap.ht
 const EXTERNAL_AUTH_WINDOW: Duration = Duration::from_secs(60);
 const AUTHENTICATION_ATTEMPT_WINDOW: Duration = Duration::from_secs(90);
 const RELOAD_FALLBACK_DELAY: Duration = Duration::from_secs(5);
+/// フッター画像1件の応答を待つ上限。超えた候補は「画像なし」として報告を先へ進める。
+const IMAGE_PROBE_TIMEOUT_MS: u64 = 3_000;
 const LOAD_GENERATION_PREFIX: &str = "__CWFCHECKER_LOAD__";
 const LOAD_GENERATION_STORAGE_KEY: &str = "__cwfcheckerLoadGeneration";
 const PORTLET_POST_SCRIPT: &str = include_str!("../../scripts/portlet-post.js");
@@ -405,6 +407,7 @@ pub(super) fn webview_script(origin: &str) -> String {
         "allowedOrigin": origin,
         "generationPrefix": LOAD_GENERATION_PREFIX,
         "generationStorageKey": LOAD_GENERATION_STORAGE_KEY,
+        "imageProbeTimeoutMs": IMAGE_PROBE_TIMEOUT_MS,
     });
     format!("({WEBVIEW_SCRIPT})({config}, ({WEBVIEW_CORE_SCRIPT}));")
 }
