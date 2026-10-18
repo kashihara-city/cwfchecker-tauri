@@ -3,6 +3,9 @@
 $root = Split-Path (Split-Path $PSScriptRoot)
 $manifest = Join-Path $root 'src-tauri\Cargo.toml'
 
+# コンパイル前に、依存の公開後日数とcargo auditを通す（CIと同じ順序）。不合格なら進まない。
+& "$PSScriptRoot\..\deps\verify.ps1"
+
 # .cargo/config.tomlを拾わせるため、作業ディレクトリをリポジトリ内にする。
 Push-Location $root
 $generated = Mount-TauriGeneratedDirectory $root

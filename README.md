@@ -241,7 +241,7 @@ src-web/             設定画面とポートレット起動用のHTML・CSS・J
 src-tauri/           Rust/Tauriのソース、固定設定、WebViewへ注入するJavaScript
 scripts/dev-env.ps1  ビルド・テストの共通土台。Cargoの出力先と、src-tauri/genのジャンクション操作
 scripts/build/       リリースビルド。app.ps1がexeをrelease/へ置く
-scripts/deps/        依存の更新。resolve-cargo-cooldown.ps1がCargo.lockの公開後日数を検査・解決する
+scripts/deps/        依存の検査と更新。verify.ps1がコンパイル前の検査、resolve-cargo-cooldown.ps1が公開後日数の検査・解決
 scripts/test/        テスト。rust.ps1（fmt・Clippy・cargo test）、javascript.ps1（Nodeのテスト）とそのfixture
 ```
 
@@ -261,6 +261,12 @@ npmは不要です。各スクリプトはリポジトリのどこから実行�
 ```text
 release\CreateWebFlowChecker.exe
 ```
+
+rust.ps1とapp.ps1は、コンパイルの前に`scripts\deps\verify.ps1`で`Cargo.lock`を検査します。
+Windows向けに解決される依存がすべて公開から7日以上経っていること（CIと同じ検査）と、
+`cargo audit`に脆弱性がないことを確認し、どちらかに通らなければコンパイルせずに止まります。
+`Cargo.lock`を更新した直後は、先に`scripts\deps\resolve-cargo-cooldown.ps1 -Resolve`で
+7日未満の版を戻してください。
 
 生成された`CreateWebFlowChecker.exe`を任意の場所へコピーして使用できます。
 インストーラはありません。
