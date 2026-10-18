@@ -3,5 +3,8 @@
 target-dir = "temp/cargo-target"
 
 # 利用端末にVisual C++再頒布可能パッケージを要求しないよう、CRTを静的リンクする。
+# /Breproは、PEヘッダーのタイムスタンプとデバッグ情報のGUIDをリンク時刻ではなく
+# 内容のハッシュにし、同じ入力から同じexeができるようにする。
+# scripts/dev-env.ps1は環境変数RUSTFLAGSでこの設定を置き換えるので、変更は両方へ。
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/Brepro"]

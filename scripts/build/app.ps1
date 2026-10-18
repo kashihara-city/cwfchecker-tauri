@@ -28,7 +28,8 @@ try {
         cargo clean --release --manifest-path $manifest
         if ($LASTEXITCODE -ne 0) { throw 'cargo clean failed' }
     }
-    cargo build --release --locked --manifest-path $manifest
+    # custom-protocolはTauriの本番構成。開発モードの絶対パス埋め込みを避ける（Cargo.toml参照）。
+    cargo build --release --locked --features custom-protocol --manifest-path $manifest
     if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
 } finally {
     Dismount-TauriGeneratedDirectory $generated

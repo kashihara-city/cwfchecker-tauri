@@ -6,6 +6,14 @@ $root = Split-Path $PSScriptRoot
 # .cargo/config.tomlと同じ値。作業ディレクトリがリポジトリ外でも同じ場所へ出す。
 $env:CARGO_TARGET_DIR = Join-Path $root 'temp\cargo-target'
 
+# 同じソースからどの機械でも同じexeができるようにするrustcの設定。CIも同じものを使う。
+# 環境変数RUSTFLAGSは.cargo/config.tomlのrustflagsを置き換えるため、静的CRTと/Breproも
+# ここに繰り返す。--remap-path-prefixは、panic位置などに入るCargoレジストリと
+# リポジトリの絶対パス（機械ごとに違う）を固定の文字列へ置き換える。
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$env:RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=/Brepro " +
+    "--remap-path-prefix=$root=. --remap-path-prefix=$cargoHome=/cargo"
+
 # src-tauri/genをtemp/build/tauri-genへのジャンクションにする。
 # tauri-buildはgen/schemasへの書き込み先を固定しているため、作業ツリーを汚さないよう
 # 実体をtemp/へ置き、ビルド中だけリンクで見せる。

@@ -273,6 +273,10 @@ Windows向けに解決される依存がすべて公開から7日以上経って
 .\scripts\deps\resolve-cargo-cooldown.ps1 -ManifestPath .\src-tauri\Cargo.toml -Resolve
 ```
 
+app.ps1とCIは、Tauriの本番構成（`custom-protocol`）と、scripts/dev-env.ps1が設定する同じ
+`RUSTFLAGS`（静的CRT、`/Brepro`、パスの正規化）でビルドし、同じソースから同じexeが
+できることを目指しています。
+
 生成された`CreateWebFlowChecker.exe`を任意の場所へコピーして使用できます。
 インストーラはありません。
 
