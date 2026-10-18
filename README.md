@@ -232,27 +232,46 @@ WebView2の一時データは起動時に作り直します。
   マネージャー内で保持します。
 - WebView2データはプロセス別の一時フォルダーへ置き、次回起動時に削除します。
 
+## リポジトリの構成
+
+```text
+.cargo/config.toml   Cargoの出力先（temp/cargo-target）と既定のrustflags
+rust-toolchain.toml  ビルドに使うRustの版。CIと手元で同じ版にする
+src-web/             設定画面とポートレット起動用のHTML・CSS・JavaScript（npmなし）
+src-tauri/           Rust/Tauriのソース、固定設定、WebViewへ注入するJavaScript
+scripts/dev-env.ps1  ビルド・テストの共通土台。Cargoの出力先と、src-tauri/genのジャンクション操作
+scripts/build/       リリースビルド。app.ps1がexeをtemp/release/へ置く
+scripts/deps/        依存の更新。resolve-cargo-cooldown.ps1がCargo.lockの公開後日数を検査・解決する
+scripts/test/        テスト。rust.ps1（fmt・Clippy・cargo test）、javascript.ps1（Nodeのテスト）とそのfixture
+```
+
 ## ビルドとテスト
 
-Rustの安定版ツールチェーンが必要です。Node.jsとnpmは不要です。
+ビルドにはRustの安定版ツールチェーンが必要です。JavaScriptのテストにはNode.jsを使いますが、
+npmは不要です。各スクリプトはリポジトリのどこから実行しても構いません。
 
 ```powershell
-cd .\src-tauri
-cargo test --locked
-cargo build --release --locked
+.\scripts\test\rust.ps1        # cargo fmt --check、Clippy、cargo test
+.\scripts\test\javascript.ps1  # 注入JavaScriptの構文検査とNodeのテスト
+.\scripts\build\app.ps1        # リリースビルド。-Cleanでreleaseプロファイルを作り直す
 ```
 
 生成されるexe：
 
 ```text
-src-tauri\target\release\CreateWebFlowChecker.exe
+temp\release\CreateWebFlowChecker.exe
 ```
 
 生成された`CreateWebFlowChecker.exe`を任意の場所へコピーして使用できます。
 インストーラはありません。
-Windows通知を確認するときは、`target\debug`または`target\release`の外へコピーして
-起動してください。Tauriの通知プラグインはこれらのフォルダーを開発実行と判定し、
-通知へアプリ識別子を設定しません。
+
+`cargo`を直接実行しても構いません。出力先は作業ディレクトリに関係なく`temp\cargo-target\`です。
+ただしTauriが`src-tauri\gen\`を実フォルダーとして生成するので、次にスクリプトを実行したとき
+ジャンクションへ置き換えられます（中身は生成物だけです）。
+
+Cargoの出力先を`cargo-target`という名前にしているのは、Tauriの通知プラグインが
+`target\debug`・`target\release`直下のexeを開発実行と判定し、通知へアプリ識別子を
+設定しないためです。この名前なら、ビルドしたexeをそのまま起動しても通知の見た目は配布版と同じです。
 
 ## 主な依存ライブラリ
 

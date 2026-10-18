@@ -1,3 +1,7 @@
+# ビルド成果物はリポジトリ直下のtemp/へ出す。相対パスは.cargoの親フォルダー基準。
+[build]
+target-dir = "temp/cargo-target"
+
 # 利用端末にVisual C++再頒布可能パッケージを要求しないよう、CRTを静的リンクする。
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

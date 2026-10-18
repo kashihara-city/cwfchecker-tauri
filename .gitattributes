@@ -1,12 +1,7 @@
-# ソースはOSに関係なくLFで保持し、改行コードだけの差分を防ぐ。
-* text=auto
-*.css text eol=lf
-*.html text eol=lf
-*.js text eol=lf
-*.json text eol=lf
-*.md text eol=lf
-*.rs text eol=lf
-*.toml text eol=lf
+# どの環境で取り出しても同じexeになるよう、テキストファイルの改行はcore.autocrlfの設定に
+# 関係なくLFで固定する（索引もLF）。src-web/はそのままexeへ埋め込まれるため、取り出し時の
+# 改行が違えば別のexeになる。RustはコンパイラがCRLFを正規化するので影響しない。
+* text=auto eol=lf
 
 # アイコンはテキスト変換の対象にしない。
 *.ico binary

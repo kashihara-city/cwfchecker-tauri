@@ -4,7 +4,7 @@
   "version": "0.1.8",
   "identifier": "jp.lg.city.kashihara.cwfchecker",
   "build": {
-    "frontendDist": "../web",
+    "frontendDist": "../src-web",
     "removeUnusedCommands": true
   },
   "app": {

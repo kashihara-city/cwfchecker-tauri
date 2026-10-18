@@ -1,30 +1,10 @@
-# Rust/Cargoのビルド成果物
-/src-tauri/target/
+# ビルド成果物、配布用バイナリ、手動検証時の一時ファイル
+# Cargoの出力先は.cargo/config.toml、Tauri生成物の実体はscripts/dev-env.ps1でここへ振り向ける
+/temp/
 
-# Tauriがコマンドや権限定義から自動生成するスキーマ
-/src-tauri/gen/schemas/
+# Tauriがコマンドや権限定義から自動生成するスキーマ。出力先はtauri-build側で固定なので、
+# スクリプト経由のビルド中だけtemp/build/tauri-genへのジャンクションとして現れる
+/src-tauri/gen/
 
-# 配布用バイナリと手動検証時の画像・一時ファイル
-/release/
-/verification/
-
-# ローカル環境固有の設定や秘密情報
-.env
-.env.*
-!.env.example
-
-# エディター・OS・ログの一時ファイル
-/.idea/
-/.vscode/
-*.log
-Thumbs.db
-.DS_Store
-
-# Windowsリンカーが生成する中間ファイル
-*.exp
-*.ilk
-*.lib
-*.pdb
-
-# コードレビューのローカルメモ
-/review.md
+# コードレビューなどのローカルメモ
+/notes/

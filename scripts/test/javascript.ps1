@@ -1,11 +1,12 @@
+﻿# src-tauri/scripts・web・scripts/testのJavaScriptを構文検査し、Nodeのテストを流す。
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $javascriptRoots = @(
     (Join-Path $repositoryRoot "src-tauri\scripts"),
-    (Join-Path $repositoryRoot "web"),
-    (Join-Path $repositoryRoot "tests\javascript")
+    (Join-Path $repositoryRoot "src-web"),
+    (Join-Path $repositoryRoot "scripts\test")
 )
 $javascriptFiles = @(
     Get-ChildItem -LiteralPath $javascriptRoots -Filter "*.js" -File -Recurse
@@ -24,7 +25,7 @@ foreach ($file in $javascriptFiles) {
 
 $testFiles = @(
     Get-ChildItem `
-        -LiteralPath (Join-Path $repositoryRoot "tests\javascript") `
+        -LiteralPath (Join-Path $repositoryRoot "scripts\test") `
         -Filter "*.test.js" `
         -File |
         ForEach-Object { $_.FullName }

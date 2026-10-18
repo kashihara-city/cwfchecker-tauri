@@ -11,7 +11,7 @@ const corePath = join(__dirname, "..", "..", "src-tauri", "scripts", "cwf-scan-c
 const createCwfScanCore = runInNewContext(`(${readFileSync(corePath, "utf8")})`);
 const { isDecisionHref, scanCwfDocument } = createCwfScanCore();
 
-const fixtureDirectory = join(__dirname, "..", "fixtures");
+const fixtureDirectory = join(__dirname, "fixtures");
 
 const attribute = (attributes, name) => {
   const match = attributes.match(

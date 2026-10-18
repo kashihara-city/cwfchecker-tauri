@@ -38,7 +38,7 @@ jobs:
       - name: Verify seven-day dependency cooldown
         shell: pwsh
         run: |
-          ./.github/scripts/resolve-cargo-cooldown.ps1 `
+          ./scripts/deps/resolve-cargo-cooldown.ps1 `
             -ManifestPath src-tauri/Cargo.toml `
             -MinimumAgeDays 7 `
             -TargetTriple x86_64-pc-windows-msvc
@@ -92,7 +92,7 @@ jobs:
 
       - name: Check and test JavaScript
         shell: pwsh
-        run: ./.github/scripts/test-javascript.ps1
+        run: ./scripts/test/javascript.ps1
 
       - name: Run Clippy
         shell: pwsh
