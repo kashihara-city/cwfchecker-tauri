@@ -1,6 +1,6 @@
 //! ダウンロードの保存先検査と、Windowsでの安全な自動オープンを管理する。
 
-use super::has_allowed_origin;
+use super::{has_allowed_origin, is_about_blank};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -111,9 +111,16 @@ fn is_blocked_download(path: &Path) -> bool {
         })
 }
 
-/// ダウンロードを開始したページ自体が、信頼する設定先かを確認する。
-fn can_download_from_page(url: &Url, allowed_origin: &str) -> bool {
-    has_allowed_origin(url, allowed_origin)
+/// ダウンロードを信頼してよいかを、表示中のページとダウンロードURLから判定する。
+///
+/// 表示中のページが設定先なら、そこから始まったダウンロードを許可する。
+/// ページがまだ`about:blank`の空ウィンドウ（`window.open()`直後にフォームを
+/// POSTした応答が添付だった場合など）は、空ページ自体に出所の情報がないため、
+/// 代わりにダウンロードURLが設定先であることを求める。空ウィンドウへの遷移は
+/// `on_navigation`で設定先に限られているので、外部ページが入り込む余地はない。
+fn is_trusted_download(page: &Url, download: &Url, allowed_origin: &str) -> bool {
+    has_allowed_origin(page, allowed_origin)
+        || (is_about_blank(page) && has_allowed_origin(download, allowed_origin))
 }
 
 /// 完了したファイルが、実体として管理対象のダウンロードフォルダー内にあるか確認する。
@@ -135,12 +142,14 @@ pub(super) fn configure_download(
 ) -> WebviewWindowBuilder<'_, tauri::Wry, impl Manager<tauri::Wry>> {
     builder.on_download(move |webview, event| {
         match event {
-            DownloadEvent::Requested { destination, .. } => {
-                // ダウンロードURLではなく「現在表示中のページ」を検査する。
-                // これによりIdPや認証中の外部ページからの自動保存・起動を防ぐ。
+            DownloadEvent::Requested {
+                url, destination, ..
+            } => {
+                // 「現在表示中のページ」を軸に検査し、IdPや認証中の外部ページからの
+                // 自動保存・起動を防ぐ。空ウィンドウへの応答だけはダウンロードURLで補う。
                 if !webview
                     .url()
-                    .is_ok_and(|url| can_download_from_page(&url, &allowed_origin))
+                    .is_ok_and(|page| is_trusted_download(&page, &url, &allowed_origin))
                 {
                     return false;
                 }
@@ -160,6 +169,7 @@ pub(super) fn configure_download(
                 *destination = download_dir.join(filename);
             }
             DownloadEvent::Finished {
+                url,
                 path: Some(path),
                 success: true,
                 ..
@@ -167,7 +177,7 @@ pub(super) fn configure_download(
                 && is_managed_download(&path, &download_dir)
                 && webview
                     .url()
-                    .is_ok_and(|url| can_download_from_page(&url, &allowed_origin)) =>
+                    .is_ok_and(|page| is_trusted_download(&page, &url, &allowed_origin)) =>
             {
                 // Requested後にページや保存先が変わった場合にも備え、
                 // Windowsで開く直前にオリジン・保存先・拡張子をすべて再確認する。
@@ -181,9 +191,7 @@ pub(super) fn configure_download(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        can_download_from_page, cleanup_directory, is_blocked_download, is_managed_download,
-    };
+    use super::{cleanup_directory, is_blocked_download, is_managed_download, is_trusted_download};
     use std::{
         fs,
         path::Path,
@@ -200,14 +208,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_downloads_started_from_external_pages() {
+    fn trusts_downloads_from_the_configured_page_or_into_a_blank_popup_it_opened() {
         let configured = "https://cwf.example";
-        assert!(can_download_from_page(
-            &Url::parse("https://cwf.example/XFV20/file").expect("CWF download URL"),
+        let url = |value: &str| Url::parse(value).expect("test URL");
+        let cwf_page = url("https://cwf.example/XFV20/receive/spf/approve_form");
+        let cwf_file = url("https://cwf.example/XFV20/file");
+        let external_file = url("https://idp.example/file");
+        // 設定先のページから始まったダウンロードは、ファイルの行き先を問わず許可する。
+        assert!(is_trusted_download(&cwf_page, &cwf_file, configured));
+        assert!(is_trusted_download(&cwf_page, &external_file, configured));
+        // 外部ページ（IdP等）からは、設定先のファイルでも拒否する。
+        assert!(!is_trusted_download(
+            &url("https://idp.example/login"),
+            &cwf_file,
             configured
         ));
-        assert!(!can_download_from_page(
-            &Url::parse("https://idp.example/file").expect("external download URL"),
+        // 空ウィンドウへPOSTした応答が添付になった場合は、ダウンロードURLで判定する。
+        assert!(is_trusted_download(
+            &url("about:blank"),
+            &cwf_file,
+            configured
+        ));
+        assert!(!is_trusted_download(
+            &url("about:blank"),
+            &external_file,
             configured
         ));
     }
