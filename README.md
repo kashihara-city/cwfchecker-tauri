@@ -13,10 +13,10 @@ Windows向けデスクトップアプリケーションです。
 
 ## 何を解決し（避け）ようとしているか
 
-- メールやチャットの単発通知では、今何件溜まっているのか分かず、確認が後回しにする（後回しにされる）
+- メールやチャットの単発通知では、今何件溜まっているのか分からず、確認が後回しにする（後回しにされる）
 - 確認を後回しにしているうちに忘れる（忘れられる）
 - 添付ファイルをダウンロードして開かないといけないのが億劫
-- 結局決裁箱に溜まる紙のほうが見やすい、紙決裁よりのほうが回議が速いと言われる。ワークフローシステムが普及しない。
+- 結局決裁箱に溜まる紙のほうが見やすい、紙決裁のほうが回議が速いと言われる。ワークフローシステムが普及しない。
 - 面倒なインストール、個別設定作業、ポートレット表示の際のワークフローシステムとグループウェアのID不一致、DLL配布、長大なサプライチェーン
 
 ## 動作要件
@@ -28,7 +28,7 @@ Windows向けデスクトップアプリケーションです。
 
 ## 主な機能
 
-- タスクトレイへの常駐し、処理待ち案件を確認
+- タスクトレイへ常駐し、処理待ち案件を確認
 - 案件がある場合、メイン画面のポップアップまたはWindows通知バーで通知
 - 案件確認・決裁画面をアプリ内で完結
 - ショートカットによるメイン画面の表示・非表示
@@ -236,14 +236,15 @@ WebView2の一時データは起動時に作り直します。
 ## リポジトリの構成
 
 ```text
-.cargo/config.toml   Cargoの出力先（temp/cargo-target）と既定のrustflags
-rust-toolchain.toml  ビルドに使うRustの版。CIと手元で同じ版にする
-src-web/             設定画面とポートレット起動用のHTML・CSS・JavaScript（npmなし）
-src-tauri/           Rust/Tauriのソース、固定設定、WebViewへ注入するJavaScript
-scripts/dev-env.ps1  ビルド・テストの共通土台。Cargoの出力先と、src-tauri/genのジャンクション操作
-scripts/build/       リリースビルド。app.ps1がexeをrelease/へ置く
-scripts/deps/        依存の検査と更新。verify.ps1がコンパイル前の検査、resolve-cargo-cooldown.ps1が公開後日数の検査・解決
-scripts/test/        テスト。rust.ps1（fmt・Clippy・cargo test）、javascript.ps1（Nodeのテスト）とそのfixture
+src-tauri/           Rust/Tauriのソースと設定、注入するJavaScript
+src-web/             設定画面と起動用ページ（HTML・CSS・JavaScript）
+scripts/dev-env.ps1  各スクリプト共通の環境設定
+scripts/build/       リリースビルド（app.ps1）
+scripts/test/        テスト（rust.ps1、javascript.ps1）
+scripts/deps/        依存の検査と更新
+.github/workflows/   タグからのリリース
+.cargo/config.toml   Cargoの出力先とrustflags
+rust-toolchain.toml  Rustの版
 ```
 
 ## ビルドとテスト
@@ -275,42 +276,18 @@ Windows向けに解決される依存がすべて公開から7日以上経って
 生成された`CreateWebFlowChecker.exe`を任意の場所へコピーして使用できます。
 インストーラはありません。
 
-`cargo`を直接実行しても構いません。出力先は作業ディレクトリに関係なく`temp\cargo-target\`です。
-ただしTauriが`src-tauri\gen\`を実フォルダーとして生成するので、次にスクリプトを実行したとき
-ジャンクションへ置き換えられます（中身は生成物だけです）。
-
-Cargoの出力先を`cargo-target`という名前にしているのは、Tauriの通知プラグインが
-`target\debug`・`target\release`直下のexeを開発実行と判定し、通知へアプリ識別子を
-設定しないためです。この名前なら、ビルドしたexeをそのまま起動しても通知の見た目は配布版と同じです。
-
 ## リリース
-
-配布する exe は GitHub Actions が作ります。手元でビルドした exe は配布しません。
-
-1. `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/tauri.conf.json` の版を揃えてコミットします。
-2. 同じ版のタグ（例 `v0.1.9`）を打って push します。push や pull request だけではワークフローは動きません。
-3. ワークフロー（`.github/workflows/release.yml`）がタグのソースを検査（fmt、JavaScript テスト、
-   依存の公開後日数、cargo audit、Clippy、テスト）してからビルドし、来歴（attestation）を付けて
-   GitHub Release を作ります。同じタグの Release が既にあれば失敗し、置き換えません。
 
 Release には `CreateWebFlowChecker.exe` と、その SHA256 を書いた `CreateWebFlowChecker.exe.sha256` が
 付きます。ノートには来歴の確認コマンドと SHA256 の表だけを載せます。受け取った側は
 `gh attestation verify CreateWebFlowChecker.exe --repo kashihara-city/cwfchecker-tauri` で、
 その exe がこのリポジトリのタグから GitHub Actions が組んだものだと確かめられます。
 
-タグを打たずに検査とビルドだけを回したいときは、GitHub の Actions 画面から同じワークフローを
-手動実行（Run workflow）します。その場合は来歴も Release も作りません。
 
 ## 主な依存ライブラリ
 
-- Tauri 2
-- `tauri-plugin-global-shortcut`
-- `tauri-plugin-single-instance`
-- `tauri-plugin-notification`
-- `winreg`
-- Windows API (`windows-sys`)
-- `serde` / `serde_json`
-- `url`
+- Tauri 2.12.3
+
 
 ## ライセンス
 

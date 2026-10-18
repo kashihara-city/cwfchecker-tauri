@@ -1,6 +1,6 @@
 # CreateWebFlowChecker Tauri移植方針
 
-- Windows 10/11 x64専用、npm・Node.js・JavaScriptパッケージ不使用。
+- Windows 11 x64専用、npm・Node.js・JavaScriptパッケージ不使用。
 - 配布物はWebView2 Runtimeを同梱しない単独EXEとする。
 - 設定は `HKCU\Software\KashiharaCity\CwfChecker` に保存する。
 - IDとパスワードはWindows資格情報 `KashiharaCity.CwfChecker` に保存する。
@@ -13,7 +13,7 @@
 - Windows向け解決グラフのCargo依存は公開後7日経過を確認し、`cargo audit` 後に `--locked` でビルドする。
 - JavaScriptはActionsで構文・単体テストを行い、実画面由来の4 HTML fixtureでDOM判定を検証する。
 - `withGlobalTauri` はIPCの認可設定ではなく、公開JavaScript API一式を
-  `window.__TAURI__` に載せる設定である。無効でもTauri 2.11.5のWindows実装では
+  `window.__TAURI__` に載せる設定である。無効でもTauri 2のWindows実装（2.11.5で確認）では
   `window.__TAURI_INTERNALS__` とIPC機構が各documentへ注入され、CWFへの遷移後も
   利用可能な形で存在する。ただし`window.__TAURI_INTERNALS__`は公開APIではなく、
   長期互換性を前提にできないため、これを設定画面から直接呼ぶことで
