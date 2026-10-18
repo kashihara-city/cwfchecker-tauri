@@ -283,6 +283,24 @@ Cargoの出力先を`cargo-target`という名前にしているのは、Tauri�
 `target\debug`・`target\release`直下のexeを開発実行と判定し、通知へアプリ識別子を
 設定しないためです。この名前なら、ビルドしたexeをそのまま起動しても通知の見た目は配布版と同じです。
 
+## リリース
+
+配布する exe は GitHub Actions が作ります。手元でビルドした exe は配布しません。
+
+1. `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/tauri.conf.json` の版を揃えてコミットします。
+2. 同じ版のタグ（例 `v0.1.9`）を打って push します。push や pull request だけではワークフローは動きません。
+3. ワークフロー（`.github/workflows/release.yml`）がタグのソースを検査（fmt、JavaScript テスト、
+   依存の公開後日数、cargo audit、Clippy、テスト）してからビルドし、来歴（attestation）を付けて
+   GitHub Release を作ります。同じタグの Release が既にあれば失敗し、置き換えません。
+
+Release には `CreateWebFlowChecker.exe` と、その SHA256 を書いた `CreateWebFlowChecker.exe.sha256` が
+付きます。ノートには来歴の確認コマンドと SHA256 の表だけを載せます。受け取った側は
+`gh attestation verify CreateWebFlowChecker.exe --repo kashihara-city/cwfchecker-tauri` で、
+その exe がこのリポジトリのタグから GitHub Actions が組んだものだと確かめられます。
+
+タグを打たずに検査とビルドだけを回したいときは、GitHub の Actions 画面から同じワークフローを
+手動実行（Run workflow）します。その場合は来歴も Release も作りません。
+
 ## 主な依存ライブラリ
 
 - Tauri 2

@@ -1,9 +1,13 @@
-name: Release Windows application
+# タグ v* を push すると、ランナーだけでソースを検査・ビルド・テストし、来歴（attestation）を
+# 付けて GitHub Release に載せる。push や pull request では動かない。
+# 手動実行（workflow_dispatch）では検査・ビルド・テストだけを行い、来歴と Release は作らない。
+name: Release
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
@@ -11,29 +15,31 @@ concurrency:
 
 jobs:
   release:
-    name: Build, attest, and publish
-    runs-on: windows-latest
+    name: Check, build, test, attest and publish
+    # The OS generation is chosen here, not by GitHub's moving "windows-latest".
+    runs-on: windows-2025
     timeout-minutes: 120
     permissions:
       contents: write
       id-token: write
       attestations: write
-      artifact-metadata: write
 
     steps:
-      - name: Check out tagged source
+      - name: Check out the tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Use pinned Rust toolchain
+      - name: Report the toolchain
         shell: pwsh
         run: |
           rustup show active-toolchain
           rustc --version --verbose
           cargo --version
+          node --version
 
-      - name: Verify tag matches committed versions
+      - name: Verify the tag matches the committed versions
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           TAG_NAME: ${{ github.ref_name }}
@@ -94,6 +100,7 @@ jobs:
               "Commit the version bump before tagging."
             )
           }
+          "Version $version"
 
       - name: Check formatting
         shell: pwsh
@@ -103,11 +110,11 @@ jobs:
         shell: pwsh
         run: ./scripts/test/javascript.ps1
 
-      - name: Populate Cargo sparse-index cache
+      - name: Fetch the locked Rust dependencies
         shell: pwsh
         run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml
 
-      - name: Verify seven-day dependency cooldown
+      - name: Verify the seven-day dependency cooldown
         shell: pwsh
         run: |
           ./scripts/deps/resolve-cargo-cooldown.ps1 `
@@ -115,7 +122,7 @@ jobs:
             -MinimumAgeDays 7 `
             -TargetTriple x86_64-pc-windows-msvc
 
-      - name: Verify release inputs were not modified
+      - name: Verify the release inputs were not modified
         shell: pwsh
         run: |
           $changes = @(
@@ -135,7 +142,7 @@ jobs:
         shell: pwsh
         run: cargo install cargo-audit --version 0.22.2 --locked
 
-      - name: Audit locked dependencies
+      - name: Audit the locked dependencies
         shell: pwsh
         run: |
           $auditLines = @(cargo audit --file src-tauri/Cargo.lock --json)
@@ -170,139 +177,61 @@ jobs:
             -- `
             -D warnings
 
-      - name: Run tests
+      - name: Run the tests
         shell: pwsh
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
-      - name: Build release executable
+      - name: Build the release executable
         shell: pwsh
         run: cargo build --release --locked --manifest-path src-tauri/Cargo.toml
 
-      - name: Attest release executable
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
-        with:
-          subject-path: temp/cargo-target/release/CreateWebFlowChecker.exe
-
-      - name: Prepare release executable
-        id: release_asset
+      - name: Package the executable
+        id: package
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $executablePath = (Resolve-Path `
-            -LiteralPath "temp/cargo-target/release/CreateWebFlowChecker.exe"
-          ).Path
-          $executableHash = (
-            Get-FileHash -LiteralPath $executablePath -Algorithm SHA256
-          ).Hash.ToLowerInvariant()
+          $exe = (Resolve-Path -LiteralPath "temp/cargo-target/release/CreateWebFlowChecker.exe").Path
+          $sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          # sha256sum 形式の添付ファイル。Release の表と同じ値を、ファイルでも配る。
+          Set-Content -LiteralPath "$exe.sha256" -Value "$sha256  $(Split-Path $exe -Leaf)" -Encoding ascii -NoNewline
+          "exe=$exe" >> $env:GITHUB_OUTPUT
+          "exe_sha256=$sha256" >> $env:GITHUB_OUTPUT
+          "$(Split-Path $exe -Leaf)  $sha256"
 
-          "executable_path=$executablePath" >> $env:GITHUB_OUTPUT
-          "executable_sha256=$executableHash" >> $env:GITHUB_OUTPUT
+      - name: Attest the build provenance of the executable
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: ${{ steps.package.outputs.exe }}
 
-      - name: Complete draft and publish GitHub Release
+      - name: Publish the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
           REPOSITORY: ${{ github.repository }}
-          EXECUTABLE_PATH: ${{ steps.release_asset.outputs.executable_path }}
-          EXECUTABLE_SHA256: ${{ steps.release_asset.outputs.executable_sha256 }}
+          EXE: ${{ steps.package.outputs.exe }}
+          EXE_SHA256: ${{ steps.package.outputs.exe_sha256 }}
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
           $tag = $env:TAG_NAME
+          $exeName = Split-Path $env:EXE -Leaf
+          gh release view $tag --json isDraft --repo $env:REPOSITORY 2> $null | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists. Published release assets are not replaced." }
+          # YAML は共通のインデントを剥がすので、PowerShell には列 0 の here-string として届く。
+          $template = @'
+          GitHub Actions がこのタグのソースから組んだ実行ファイルです。
+          来歴の確認: `gh attestation verify {0} --repo {1}`
 
-          $releaseJsonLines = @(
-            gh release view `
-              $tag `
-              --json isDraft,body `
-              --repo $env:REPOSITORY 2> $null
-          )
-          $releaseExists = $LASTEXITCODE -eq 0
-
-          if ($releaseExists) {
-            $release = ($releaseJsonLines -join "`n") | ConvertFrom-Json
-            if (-not $release.isDraft) {
-              throw (
-                "Release $tag is already published. " +
-                "Published release assets are not replaced."
-              )
-            }
-            gh release upload `
-              $tag `
-              $env:EXECUTABLE_PATH `
-              --clobber `
-              --repo $env:REPOSITORY
-          } else {
-            gh release create `
-              $tag `
-              $env:EXECUTABLE_PATH `
-              --draft `
-              --verify-tag `
-              --generate-notes `
-              --fail-on-no-commits `
-              --title "CreateWebFlowChecker $tag" `
-              --repo $env:REPOSITORY
-          }
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not create or update draft Release $tag."
-          }
-
-          $bodyLines = @(
-            gh release view `
-              $tag `
-              --json body `
-              --jq ".body" `
-              --repo $env:REPOSITORY
-          )
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not read draft Release $tag."
-          }
-
-          $body = $bodyLines -join "`n"
-          $releaseFooterPattern = (
-            '(?im)(?:\A|\r?\n+)\s*' +
-            '(?:provenance:\s*' +
-            '`gh attestation verify CreateWebFlowChecker\.exe ' +
-            '--repo [^`\r\n]+`\s*\r?\n+\s*)?' +
-            'sha-?256:\s*' +
-            '`[0-9a-f]{64}`\s*\z'
-          )
-          $bodyWithoutChecksum = [regex]::Replace(
-            $body,
-            $releaseFooterPattern,
-            ""
-          ).TrimEnd()
-          $attestationLine = (
-            "provenance: ``gh attestation verify CreateWebFlowChecker.exe " +
-            "--repo $env:REPOSITORY``"
-          )
-          $checksumLine = 'sha256: `' + $env:EXECUTABLE_SHA256 + '`'
-          $updatedBody = "$attestationLine`n`n$checksumLine"
-          if ($bodyWithoutChecksum) {
-            $updatedBody = (
-              "$bodyWithoutChecksum`n`n" +
-              "$attestationLine`n`n" +
-              $checksumLine
-            )
-          }
-
+          | ファイル | SHA256 |
+          | --- | --- |
+          | `{0}` | `{2}` |
+          '@
+          $notes = $template -f $exeName, $env:REPOSITORY, $env:EXE_SHA256
           $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
-          Set-Content `
-            -LiteralPath $notesPath `
-            -Value $updatedBody `
-            -Encoding utf8
-          gh release edit `
-            $tag `
-            --notes-file $notesPath `
-            --repo $env:REPOSITORY
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not write the SHA-256 to draft Release $tag."
-          }
-
-          gh release edit `
-            $tag `
-            --draft=false `
-            --repo $env:REPOSITORY
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not publish draft Release $tag."
-          }
+          Set-Content -LiteralPath $notesPath -Value $notes -Encoding utf8
+          gh release create $tag $env:EXE "$env:EXE.sha256" `
+            --verify-tag --title "CreateWebFlowChecker $tag" --notes-file $notesPath --repo $env:REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw "Could not create Release $tag." }
