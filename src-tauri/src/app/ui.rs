@@ -236,12 +236,30 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
             })
             .unwrap_or(0);
         if previous <= 1 {
-            if let Err(error) = cleanup_directory(&state.download_dir) {
-                eprintln!("ダウンロードフォルダーを空にできませんでした: {error}");
-            }
-            show_main(app);
+            finish_decisions_when_none_remain(app.clone(), state.inner().clone());
         }
     }
+}
+
+/// 案件ウィンドウの入れ替わり中に0件になった瞬間を、終了と取り違えないよう少し待つ。
+///
+/// 一覧の案件リンクは、前の案件ウィンドウを`window.close()`で閉じた直後に次を
+/// `window.open()`する。閉じる処理はRustへ合図してから行われるため、次の
+/// ウィンドウが数えられる前に件数が一度0になり得る。
+const DECISION_SWITCH_GRACE: Duration = Duration::from_millis(500);
+
+/// 待っても案件ウィンドウが残っていなければ、添付を片付けてメイン画面へ戻る。
+fn finish_decisions_when_none_remain(app: AppHandle, state: Arc<AppState>) {
+    thread::spawn(move || {
+        thread::sleep(DECISION_SWITCH_GRACE);
+        if state.decisions.load(Ordering::Relaxed) > 0 || state.quitting.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(error) = cleanup_directory(&state.download_dir) {
+            eprintln!("ダウンロードフォルダーを空にできませんでした: {error}");
+        }
+        show_main(&app);
+    });
 }
 
 /// グローバルショートカットが押されたとき、メイン画面の表示状態を切り替える。

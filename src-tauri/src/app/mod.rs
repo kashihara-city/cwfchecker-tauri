@@ -164,6 +164,14 @@ fn has_allowed_origin(url: &Url, allowed_origin: &str) -> bool {
     matches!(url.scheme(), "http" | "https") && url.origin().ascii_serialization() == allowed_origin
 }
 
+/// URLが、ページが中身を後から流し込むための空ページ`about:blank`かを確認する。
+///
+/// CWFの決裁画面は、PDFプレビューを`window.open("about:blank", 名前)`で空の
+/// ウィンドウを先に作り、そこへフォームをPOSTする手順で開く。
+fn is_about_blank(url: &Url) -> bool {
+    url.scheme() == "about" && url.path() == "blank"
+}
+
 #[tauri::command]
 /// 設定画面だけに、パスワードを除いた現在値を返すTauriコマンド。
 pub fn get_settings(
@@ -356,7 +364,10 @@ pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_portlet_endpoint, has_allowed_origin, CURRENT_VERSION, NOTIFICATION_TITLE};
+    use super::{
+        build_portlet_endpoint, has_allowed_origin, is_about_blank, CURRENT_VERSION,
+        NOTIFICATION_TITLE,
+    };
     use crate::{credentials, settings::Settings};
     use url::Url;
 
@@ -374,6 +385,19 @@ mod tests {
         assert!(!has_allowed_origin(
             &Url::parse("file:///C:/temp/test.html").expect("local file URL"),
             allowed
+        ));
+    }
+
+    #[test]
+    fn recognizes_only_the_blank_page() {
+        assert!(is_about_blank(
+            &Url::parse("about:blank").expect("blank URL")
+        ));
+        assert!(!is_about_blank(
+            &Url::parse("about:srcdoc").expect("srcdoc URL")
+        ));
+        assert!(!is_about_blank(
+            &Url::parse("https://workflow.example/blank").expect("web URL")
         ));
     }
 

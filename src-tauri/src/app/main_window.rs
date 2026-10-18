@@ -9,7 +9,7 @@ use super::{
         portlet_post_script, process_page_report, webview_script,
     },
     downloads::{configure_download, open_external},
-    has_allowed_origin,
+    has_allowed_origin, is_about_blank,
     ui::{build_window_menu, handle_window_menu},
     AppState, APP_TITLE, MAIN_LABEL,
 };
@@ -23,6 +23,62 @@ use tauri::{
 };
 use url::Url;
 
+/// 案件ウィンドウのページが`window.close()`を呼んだときに、document.titleへ載せる合図。
+const CLOSE_REQUEST_TITLE: &str = "__CWFCHECKER_CLOSE__";
+const WINDOW_CLOSE_SCRIPT: &str = include_str!("../../scripts/window-close.js");
+
+/// 案件ウィンドウへ注入し、ページの`window.close()`をRust側の終了処理へ置き換える。
+///
+/// WebView2では`window.close()`がWebViewの入れ物（子ウィンドウ）だけを壊し、
+/// 外側のウィンドウが黒いまま残る（wry 0.57時点）。CWFはプレビュー画面の
+/// 「閉じる」や、次の案件を開く前の`winDetail.close()`でこれを呼ぶため、
+/// 合図を受けたRustが通常の閉じる処理を行う。
+fn decision_window_script() -> String {
+    let config = serde_json::json!({ "closeTitle": CLOSE_REQUEST_TITLE });
+    format!("({WINDOW_CLOSE_SCRIPT})({config});")
+}
+
+/// document.titleが、ページからの閉じる要求の合図そのものかを確認する。
+fn is_close_request_title(title: &str) -> bool {
+    title == CLOSE_REQUEST_TITLE
+}
+
+/// 新規ウィンドウ要求に対する扱い。
+#[derive(Debug, PartialEq, Eq)]
+enum NewWindowPolicy {
+    /// 同じ制限付きの案件ウィンドウを作り、要求元にそのウィンドウを返す。
+    Create,
+    /// 資格情報を持つWebViewから分離し、既定ブラウザーで開く。
+    OpenExternal,
+    /// 何も開かない。要求元の`window.open()`はnullを受け取る。
+    Deny,
+}
+
+/// 新規ウィンドウ要求のURLから扱いを決める。
+///
+/// `about:blank`は、ページが名前付きの空ウィンドウを先に作り、そこへフォームを
+/// POSTする手順で使われる（CWF決裁画面のPDFプレビュー）。拒否すると
+/// `window.open()`がnullになり、ページ側の処理が直後の例外で止まる。
+/// 作られるウィンドウにも同一オリジン制限、新規ウィンドウ検査、ダウンロード検査が
+/// 付くため、空のまま作っても外部へ出る経路は増えない。
+fn new_window_policy(url: &Url, origin: &str) -> NewWindowPolicy {
+    if is_about_blank(url) {
+        return NewWindowPolicy::Create;
+    }
+    if !has_allowed_origin(url, origin) {
+        // 外部リンクは資格情報を持つWebViewへ読み込まず、通常ブラウザへ分離する。
+        return if matches!(url.scheme(), "http" | "https") {
+            NewWindowPolicy::OpenExternal
+        } else {
+            NewWindowPolicy::Deny
+        };
+    }
+    if url.path().ends_with("/XFV20/login") {
+        return NewWindowPolicy::OpenExternal;
+    }
+    NewWindowPolicy::Create
+}
+
 /// CWF内のリンクから開く案件ウィンドウを、世代を問わず同じ制限付きで作る。
 ///
 /// 案件ウィンドウ内の`target="_blank"`や`window.open()`もこの関数へ戻すことで、
@@ -34,16 +90,13 @@ fn handle_new_window(
     url: Url,
     features: NewWindowFeatures,
 ) -> NewWindowResponse<Wry> {
-    if !has_allowed_origin(&url, &origin) {
-        // 外部リンクは資格情報を持つWebViewへ読み込まず、通常ブラウザへ分離する。
-        if matches!(url.scheme(), "http" | "https") {
+    match new_window_policy(&url, &origin) {
+        NewWindowPolicy::Create => {}
+        NewWindowPolicy::OpenExternal => {
             let _ = open_external(url.as_str());
+            return NewWindowResponse::Deny;
         }
-        return NewWindowResponse::Deny;
-    }
-    if url.path().ends_with("/XFV20/login") {
-        let _ = open_external(url.as_str());
-        return NewWindowResponse::Deny;
+        NewWindowPolicy::Deny => return NewWindowResponse::Deny,
     }
 
     let number = state.decision_counter.fetch_add(1, Ordering::Relaxed);
@@ -66,9 +119,13 @@ fn handle_new_window(
     .window_features(features)
     .maximized(true)
     .data_directory(state.cache_root.clone())
-    .on_navigation(move |url| {
-        url.as_str() == "about:blank" || has_allowed_origin(url, &decision_origin)
+    .initialization_script(decision_window_script())
+    .on_document_title_changed(|window, title| {
+        if is_close_request_title(&title) {
+            let _ = window.close();
+        }
     })
+    .on_navigation(move |url| is_about_blank(url) || has_allowed_origin(url, &decision_origin))
     .on_new_window(move |url, features| {
         handle_new_window(
             &app_for_popup,
@@ -211,4 +268,61 @@ pub(super) fn create_main_window(
         .build()
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decision_window_script, is_close_request_title, new_window_policy, NewWindowPolicy,
+    };
+    use url::Url;
+
+    fn policy(url: &str) -> NewWindowPolicy {
+        new_window_policy(
+            &Url::parse(url).expect("test URL"),
+            "https://workflow.example",
+        )
+    }
+
+    #[test]
+    fn creates_decision_windows_for_the_configured_origin_and_blank_popups() {
+        assert_eq!(
+            policy("https://workflow.example/XFV20/receive/spf/approve_form?StatusId=1"),
+            NewWindowPolicy::Create
+        );
+        // 決裁画面のPDFプレビューは、空の名前付きウィンドウを先に開いてからPOSTする。
+        assert_eq!(policy("about:blank"), NewWindowPolicy::Create);
+    }
+
+    #[test]
+    fn separates_external_pages_into_the_default_browser() {
+        assert_eq!(
+            policy("https://other.example/manual"),
+            NewWindowPolicy::OpenExternal
+        );
+        // スキーム違いは別オリジンなので、設定先と同じホストでも外へ出す。
+        assert_eq!(
+            policy("http://workflow.example/XFV20/portlet"),
+            NewWindowPolicy::OpenExternal
+        );
+        assert_eq!(
+            policy("https://workflow.example/XFV20/login"),
+            NewWindowPolicy::OpenExternal
+        );
+    }
+
+    #[test]
+    fn wires_the_close_signal_between_the_script_and_the_title_handler() {
+        assert!(decision_window_script().contains("__CWFCHECKER_CLOSE__"));
+        assert!(is_close_request_title("__CWFCHECKER_CLOSE__"));
+        assert!(!is_close_request_title("__CWFCHECKER_CLOSE__ "));
+        assert!(!is_close_request_title("ワークフローシステム プレビュー"));
+    }
+
+    #[test]
+    fn denies_popups_that_are_neither_web_pages_nor_blank() {
+        assert_eq!(policy("about:srcdoc"), NewWindowPolicy::Deny);
+        assert_eq!(policy("file:///C:/temp/test.html"), NewWindowPolicy::Deny);
+        assert_eq!(policy("data:text/html,hi"), NewWindowPolicy::Deny);
+    }
 }

@@ -38,6 +38,10 @@ Stop-ReleaseCopies
 $built = Join-Path $env:CARGO_TARGET_DIR "release\$exeName"
 $placed = Join-Path $release $exeName
 Copy-Item -LiteralPath $built -Destination $placed -Force
+# 上書きでも消して置き直しても、NTFSは同名ファイルの古い作成日時を引き継ぐため、
+# エクスプローラーの「日付」欄が何か月も前に見える。作成日時を更新日時に揃える。
+$item = Get-Item -LiteralPath $placed
+$item.CreationTime = $item.LastWriteTime
 $hash = (Get-FileHash -LiteralPath $placed -Algorithm SHA256).Hash.ToLowerInvariant()
 Write-Host "Built $placed"
 Write-Host "sha256: $hash"
