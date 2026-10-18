@@ -40,6 +40,11 @@
     "cwfchecker_footer02.png", "cwfchecker_footer03.png",
     "cwfchecker_footer04.png", "cwfchecker_footer05.png"
   ];
+  // 画像関係の待ちはどれも期限付きにし、期限を過ぎたら報告へ進む。
+  const withinTimeout = (promise, milliseconds) => Promise.race([
+    promise.catch(() => undefined),
+    new Promise(resolve => setTimeout(resolve, milliseconds)),
+  ]);
   const checkImage = (url) => new Promise((resolve) => {
     const image = new Image();
     // ポートレットURLの認証クエリを画像リクエストのRefererへ載せない。
@@ -97,11 +102,12 @@
           const previousOverflowY = root.style.overflowY;
           root.style.overflowY = "hidden";
           try {
-            try { await image.decode(); } catch {}
+            // decodeと描画フレームが来ない場合も、期限後は現状の高さで報告する。
+            await withinTimeout(image.decode(), config.imageProbeTimeoutMs);
             // 画像のレイアウト確定を2フレーム待ってから、Rust側へ正確な高さを返す。
-            await new Promise(resolve => requestAnimationFrame(
+            await withinTimeout(new Promise(resolve => requestAnimationFrame(
               () => requestAnimationFrame(resolve)
-            ));
+            )), config.imageProbeTimeoutMs);
             contentHeight = Math.ceil(footer.getBoundingClientRect().bottom + window.scrollY);
           } finally {
             root.style.overflowY = previousOverflowY;
