@@ -54,16 +54,21 @@ enum NewWindowPolicy {
     Deny,
 }
 
-/// 新規ウィンドウ要求のURLから扱いを決める。
+/// 新規ウィンドウ要求のURLと、要求元のページが設定先かどうかから扱いを決める。
 ///
 /// `about:blank`は、ページが名前付きの空ウィンドウを先に作り、そこへフォームを
 /// POSTする手順で使われる（CWF決裁画面のPDFプレビュー）。拒否すると
 /// `window.open()`がnullになり、ページ側の処理が直後の例外で止まる。
-/// 作られるウィンドウにも同一オリジン制限、新規ウィンドウ検査、ダウンロード検査が
-/// 付くため、空のまま作っても外部へ出る経路は増えない。
-fn new_window_policy(url: &Url, origin: &str) -> NewWindowPolicy {
+/// 空ウィンドウの中身は要求元のページが決めるため、要求元が設定先のページで
+/// あるときだけ作る。SAML認証中のIdPなど外部ページからの空ウィンドウは作らず、
+/// 設定先の添付を外部ページの指図で保存・起動する経路を残さない。
+fn new_window_policy(url: &Url, origin: &str, opener_is_trusted: bool) -> NewWindowPolicy {
     if is_about_blank(url) {
-        return NewWindowPolicy::Create;
+        return if opener_is_trusted {
+            NewWindowPolicy::Create
+        } else {
+            NewWindowPolicy::Deny
+        };
     }
     if !has_allowed_origin(url, origin) {
         // 外部リンクは資格情報を持つWebViewへ読み込まず、通常ブラウザへ分離する。
@@ -87,10 +92,17 @@ fn handle_new_window(
     app: &AppHandle,
     state: Arc<AppState>,
     origin: String,
+    opener_label: &str,
     url: Url,
     features: NewWindowFeatures,
 ) -> NewWindowResponse<Wry> {
-    match new_window_policy(&url, &origin) {
+    // 要求元ウィンドウが今表示しているページで信頼を判断する。メイン画面は
+    // SAML認証中に外部ページを表示し得るため、ラベルではなく現在のURLを見る。
+    let opener_is_trusted = app
+        .get_webview_window(opener_label)
+        .and_then(|window| window.url().ok())
+        .is_some_and(|current| has_allowed_origin(&current, &origin));
+    match new_window_policy(&url, &origin, opener_is_trusted) {
         NewWindowPolicy::Create => {}
         NewWindowPolicy::OpenExternal => {
             let _ = open_external(url.as_str());
@@ -110,6 +122,7 @@ fn handle_new_window(
     let app_for_popup = app.clone();
     let state_for_popup = state.clone();
     let origin_for_popup = origin;
+    let opener_label = label.clone();
     let decision = WebviewWindowBuilder::new(
         app,
         label,
@@ -131,6 +144,7 @@ fn handle_new_window(
             &app_for_popup,
             state_for_popup.clone(),
             origin_for_popup.clone(),
+            &opener_label,
             url,
             features,
         )
@@ -260,6 +274,7 @@ pub(super) fn create_main_window(
             &app_for_popup,
             state_for_popup.clone(),
             origin_for_popup.clone(),
+            MAIN_LABEL,
             url,
             features,
         )
@@ -277,10 +292,16 @@ mod tests {
     };
     use url::Url;
 
+    /// 設定先のページ（信頼できる要求元）からの新規ウィンドウ要求。
     fn policy(url: &str) -> NewWindowPolicy {
+        policy_from(url, true)
+    }
+
+    fn policy_from(url: &str, opener_is_trusted: bool) -> NewWindowPolicy {
         new_window_policy(
             &Url::parse(url).expect("test URL"),
             "https://workflow.example",
+            opener_is_trusted,
         )
     }
 
@@ -292,6 +313,17 @@ mod tests {
         );
         // 決裁画面のPDFプレビューは、空の名前付きウィンドウを先に開いてからPOSTする。
         assert_eq!(policy("about:blank"), NewWindowPolicy::Create);
+    }
+
+    #[test]
+    fn denies_blank_popups_requested_by_external_pages() {
+        // SAML認証中のIdPなど外部ページが空ウィンドウを作り、そこへ設定先の添付を
+        // POSTする経路を残さない。設定先そのものへのポップアップは従来どおり作る。
+        assert_eq!(policy_from("about:blank", false), NewWindowPolicy::Deny);
+        assert_eq!(
+            policy_from("https://workflow.example/XFV20/portlet", false),
+            NewWindowPolicy::Create
+        );
     }
 
     #[test]
