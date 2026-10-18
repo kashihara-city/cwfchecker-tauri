@@ -55,6 +55,19 @@ pub(super) fn open_settings(app: &AppHandle) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// 2個目の起動やショートカットで「画面を前面へ」と求められたときの共通処理。
+///
+/// メイン画面があればそれを前面へ出す。初回設定中でメイン画面がまだ無い場合は、
+/// トレイの「表示」と同じように設定画面を前面へ出す。
+pub fn bring_to_front(app: &AppHandle) {
+    if let Some(main) = app.get_webview_window(MAIN_LABEL) {
+        let _ = main.show();
+        let _ = main.set_focus();
+    } else {
+        request_open_settings(app);
+    }
+}
+
 /// 短時間に複数メニューイベントが来ても設定画面を重複作成しない。
 fn request_open_settings(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(SETTINGS_LABEL) {
@@ -276,6 +289,9 @@ pub fn handle_shortcut(
             } else {
                 show_main(app);
             }
+        } else {
+            // 初回設定中はメイン画面が無いので、設定画面を前面へ出す。
+            request_open_settings(app);
         }
     }
 }

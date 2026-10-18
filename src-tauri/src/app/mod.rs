@@ -34,7 +34,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use tauri_plugin_notification::NotificationExt;
 use url::Url;
 
-pub use ui::{handle_shortcut, handle_window_event};
+pub use ui::{bring_to_front, handle_shortcut, handle_window_event};
 
 const MAIN_LABEL: &str = "main";
 const SETTINGS_LABEL: &str = "settings";

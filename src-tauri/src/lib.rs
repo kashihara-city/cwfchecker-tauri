@@ -15,8 +15,6 @@ mod registry_support;
 mod settings;
 mod version_policy;
 
-use tauri::Manager;
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 起動を拒否される古い版ほど更新対象として把握する必要があるため、
@@ -56,12 +54,9 @@ pub fn run() {
 
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
-        // 2個目のプロセスは作らず、既存のメイン画面を前面へ戻す。
+        // 2個目のプロセスは作らず、既存のメイン画面（初回設定中は設定画面）を前面へ戻す。
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(main) = app.get_webview_window("main") {
-                let _ = main.show();
-                let _ = main.set_focus();
-            }
+            app::bring_to_front(app);
         }))
         .plugin(
             // 登録するキー自体は保存済み設定からsetup内で読み取る。
