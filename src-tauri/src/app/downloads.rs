@@ -116,8 +116,9 @@ fn is_blocked_download(path: &Path) -> bool {
 /// 表示中のページが設定先なら、そこから始まったダウンロードを許可する。
 /// ページがまだ`about:blank`の空ウィンドウ（`window.open()`直後にフォームを
 /// POSTした応答が添付だった場合など）は、空ページ自体に出所の情報がないため、
-/// 代わりにダウンロードURLが設定先であることを求める。空ウィンドウへの遷移は
-/// `on_navigation`で設定先に限られているので、外部ページが入り込む余地はない。
+/// 代わりにダウンロードURLが設定先であることを求める。空ウィンドウは設定先の
+/// ページからしか作られず（`new_window_policy`）、そこへの遷移も`on_navigation`で
+/// 設定先に限られているので、外部ページが入り込む余地はない。
 fn is_trusted_download(page: &Url, download: &Url, allowed_origin: &str) -> bool {
     has_allowed_origin(page, allowed_origin)
         || (is_about_blank(page) && has_allowed_origin(download, allowed_origin))

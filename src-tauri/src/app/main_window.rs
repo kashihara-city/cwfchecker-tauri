@@ -56,27 +56,25 @@ enum NewWindowPolicy {
 
 /// 新規ウィンドウ要求のURLと、要求元のページが設定先かどうかから扱いを決める。
 ///
+/// アプリ内に作るウィンドウ（設定先へのポップアップと`about:blank`の空ウィンドウ）は、
+/// 要求元が設定先のページであるときだけ作る。SAML認証中のIdPなど外部ページが
+/// 空ウィンドウや設定先の添付URLを開いて、保存・自動起動を始める経路を残さない
+/// ためで、外部ページから開けるのは既定ブラウザーへ分離する外部リンクだけになる。
+///
 /// `about:blank`は、ページが名前付きの空ウィンドウを先に作り、そこへフォームを
 /// POSTする手順で使われる（CWF決裁画面のPDFプレビュー）。拒否すると
 /// `window.open()`がnullになり、ページ側の処理が直後の例外で止まる。
-/// 空ウィンドウの中身は要求元のページが決めるため、要求元が設定先のページで
-/// あるときだけ作る。SAML認証中のIdPなど外部ページからの空ウィンドウは作らず、
-/// 設定先の添付を外部ページの指図で保存・起動する経路を残さない。
 fn new_window_policy(url: &Url, origin: &str, opener_is_trusted: bool) -> NewWindowPolicy {
-    if is_about_blank(url) {
-        return if opener_is_trusted {
-            NewWindowPolicy::Create
-        } else {
-            NewWindowPolicy::Deny
-        };
-    }
-    if !has_allowed_origin(url, origin) {
+    if !is_about_blank(url) && !has_allowed_origin(url, origin) {
         // 外部リンクは資格情報を持つWebViewへ読み込まず、通常ブラウザへ分離する。
         return if matches!(url.scheme(), "http" | "https") {
             NewWindowPolicy::OpenExternal
         } else {
             NewWindowPolicy::Deny
         };
+    }
+    if !opener_is_trusted {
+        return NewWindowPolicy::Deny;
     }
     if url.path().ends_with("/XFV20/login") {
         return NewWindowPolicy::OpenExternal;
@@ -316,13 +314,17 @@ mod tests {
     }
 
     #[test]
-    fn denies_blank_popups_requested_by_external_pages() {
-        // SAML認証中のIdPなど外部ページが空ウィンドウを作り、そこへ設定先の添付を
-        // POSTする経路を残さない。設定先そのものへのポップアップは従来どおり作る。
+    fn denies_in_app_windows_requested_by_external_pages() {
+        // SAML認証中のIdPなど外部ページが、空ウィンドウや設定先の添付URLを開いて
+        // 保存・自動起動を始める経路を残さない。外部リンクは従来どおり既定ブラウザーへ。
         assert_eq!(policy_from("about:blank", false), NewWindowPolicy::Deny);
         assert_eq!(
-            policy_from("https://workflow.example/XFV20/portlet", false),
-            NewWindowPolicy::Create
+            policy_from("https://workflow.example/XFV20/file/attachment.pdf", false),
+            NewWindowPolicy::Deny
+        );
+        assert_eq!(
+            policy_from("https://other.example/manual", false),
+            NewWindowPolicy::OpenExternal
         );
     }
 
