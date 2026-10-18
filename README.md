@@ -266,8 +266,11 @@ release\CreateWebFlowChecker.exe
 rust.ps1とapp.ps1は、コンパイルの前に`scripts\deps\verify.ps1`で`Cargo.lock`を検査します。
 Windows向けに解決される依存がすべて公開から7日以上経っていること（CIと同じ検査）と、
 `cargo audit`に脆弱性がないことを確認し、どちらかに通らなければコンパイルせずに止まります。
-`Cargo.lock`を更新した直後は、先に`scripts\deps\resolve-cargo-cooldown.ps1 -Resolve`で
-7日未満の版を戻してください。
+`Cargo.lock`を更新した直後は、先に次のコマンドで7日未満の版を戻してください。
+
+```powershell
+.\scripts\deps\resolve-cargo-cooldown.ps1 -ManifestPath .\src-tauri\Cargo.toml -Resolve
+```
 
 生成された`CreateWebFlowChecker.exe`を任意の場所へコピーして使用できます。
 インストーラはありません。
