@@ -18,8 +18,12 @@ const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, millise
  * imagesComplete=false のとき、画像は読込み完了も失敗も通知しない。
  * imagesFound=true のとき、候補画像はすべて見つかり、フッターの挿入まで進む。
  * decodeSettles=false のとき、挿入した画像のdecode()は決して完了しない。 */
-const runScan = async ({ imagesComplete, imageProbeTimeoutMs, imagesFound = false, decodeSettles = true }) => {
+const runScan = async ({
+  imagesComplete, imageBudgetMs, imagesFound = false, decodeSettles = true, probeDelayMs = 0,
+}) => {
   const titles = [];
+  const reportTimes = [];
+  const started = Date.now();
   const decisionLink = {
     getAttribute: name =>
       name === "href" ? "javascript:showInputForm('/XFV20/receive/spf/approve_form?x=1')" : null,
@@ -41,14 +45,18 @@ const runScan = async ({ imagesComplete, imageProbeTimeoutMs, imagesFound = fals
     // 実際のブラウザーと同じく、未設定のstyle値は空文字列。
     documentElement: { style: { overflowY: "" } },
     get title() { return title; },
-    set title(value) { title = value; titles.push(value); },
+    set title(value) {
+      title = value;
+      titles.push(value);
+      if (value.startsWith("__CWFCHECKER_REPORT__|")) reportTimes.push(Date.now() - started);
+    },
   };
   class Image {
     constructor() { this.style = {}; }
     set src(value) {
       if (!imagesComplete || !value) return;
       const handler = imagesFound ? "onload" : "onerror";
-      setTimeout(() => this[handler] && this[handler](), 0);
+      setTimeout(() => this[handler] && this[handler](), probeDelayMs);
     }
     get naturalWidth() { return imagesFound ? 100 : 0; }
     decode() { return decodeSettles ? Promise.resolve() : new Promise(() => {}); }
@@ -73,23 +81,23 @@ const runScan = async ({ imagesComplete, imageProbeTimeoutMs, imagesFound = fals
     allowedOrigin: "https://cwf.example",
     generationPrefix: "__CWFCHECKER_LOAD__",
     generationStorageKey: "__cwfcheckerLoadGeneration",
-    imageProbeTimeoutMs,
+    imageBudgetMs,
   };
   runInNewContext(`(${scanSource})(config, (${coreSource}));`, { ...window, config });
-  return { window, document, titles, footerElements };
+  return { window, document, titles, footerElements, reportTimes };
 };
 
 const reports = titles => titles.filter(value => value.startsWith("__CWFCHECKER_REPORT__|"));
 
 test("reports authentication and decisions once images have answered", async () => {
-  const { window, titles } = await runScan({ imagesComplete: true, imageProbeTimeoutMs: 10000 });
+  const { window, titles } = await runScan({ imagesComplete: true, imageBudgetMs: 10000 });
   await sleep(100);
   assert.deepEqual(reports(titles), ["__CWFCHECKER_REPORT__|1|1|1|0|0|1"]);
   assert.equal(window.__cwfScanRunning, false);
 });
 
 test("still reports when footer images never answer, after the probe timeout", async () => {
-  const { window, titles } = await runScan({ imagesComplete: false, imageProbeTimeoutMs: 50 });
+  const { window, titles } = await runScan({ imagesComplete: false, imageBudgetMs: 50 });
   await sleep(300);
   assert.deepEqual(reports(titles), ["__CWFCHECKER_REPORT__|1|1|1|0|0|1"]);
   assert.equal(window.__cwfScanRunning, false);
@@ -97,7 +105,7 @@ test("still reports when footer images never answer, after the probe timeout", a
 
 test("inserts the footer and still reports when the footer image never finishes decoding", async () => {
   const { window, document, titles, footerElements } = await runScan({
-    imagesComplete: true, imagesFound: true, decodeSettles: false, imageProbeTimeoutMs: 50,
+    imagesComplete: true, imagesFound: true, decodeSettles: false, imageBudgetMs: 50,
   });
   await sleep(400);
   // 候補10件が見つかり、挿入したフッターの高さ120で報告する。
@@ -108,8 +116,19 @@ test("inserts the footer and still reports when the footer image never finishes 
   assert.equal(document.documentElement.style.overflowY, "");
 });
 
+test("shares one time budget across candidate probing and decoding", async () => {
+  // 候補の応答に120ms掛かり、decodeは完了しない。待ちごとに200msの期限があれば
+  // 報告は320ms以降になるが、共通の予算200msなら予算の時点で報告が届く。
+  const { reportTimes } = await runScan({
+    imagesComplete: true, imagesFound: true, decodeSettles: false, probeDelayMs: 120, imageBudgetMs: 200,
+  });
+  await sleep(450);
+  assert.equal(reportTimes.length, 1);
+  assert.ok(reportTimes[0] >= 180 && reportTimes[0] < 300, `reported after ${reportTimes[0]}ms`);
+});
+
 test("without the timeout, hanging images would block the report (regression guard)", async () => {
-  const { window, titles } = await runScan({ imagesComplete: false, imageProbeTimeoutMs: 10000 });
+  const { window, titles } = await runScan({ imagesComplete: false, imageBudgetMs: 10000 });
   await sleep(300);
   assert.deepEqual(reports(titles), []);
   assert.equal(window.__cwfScanRunning, true);

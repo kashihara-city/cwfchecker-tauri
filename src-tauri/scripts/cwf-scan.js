@@ -40,12 +40,14 @@
     "cwfchecker_footer02.png", "cwfchecker_footer03.png",
     "cwfchecker_footer04.png", "cwfchecker_footer05.png"
   ];
-  // 画像関係の待ちはどれも期限付きにし、期限を過ぎたら報告へ進む。
+  // 画像関係の待ち（候補の確認、decode、描画待ち）は1回の調査で合計config.imageBudgetMs
+  // までとし、期限を過ぎた待ちは打ち切って報告へ進む。待ちが重なっても、Rust側の
+  // 認証フォールバック（5秒）より先に報告が届くようにする。
   const withinTimeout = (promise, milliseconds) => Promise.race([
     promise.catch(() => undefined),
     new Promise(resolve => setTimeout(resolve, milliseconds)),
   ]);
-  const checkImage = (url) => new Promise((resolve) => {
+  const checkImage = (url, milliseconds) => new Promise((resolve) => {
     const image = new Image();
     // ポートレットURLの認証クエリを画像リクエストのRefererへ載せない。
     image.referrerPolicy = "no-referrer";
@@ -54,7 +56,7 @@
     const timeout = setTimeout(() => {
       image.src = "";
       resolve(null);
-    }, config.imageProbeTimeoutMs);
+    }, milliseconds);
     image.onload = image.onerror = () => {
       clearTimeout(timeout);
       resolve(image.naturalWidth > 0 ? url : null);
@@ -72,8 +74,10 @@
       const { decisionCount, authCount, countText } =
         cwfScanCore.scanCwfDocument(document);
       const baseUrl = window.location.href.split("XFV20")[0];
+      const imageDeadline = Date.now() + config.imageBudgetMs;
+      const imageTimeLeft = () => Math.max(0, imageDeadline - Date.now());
       const images = (await Promise.all(imageCandidates.map(
-        name => checkImage(`${baseUrl}XFV20/manual/user/_images/${name}`)
+        name => checkImage(`${baseUrl}XFV20/manual/user/_images/${name}`, imageTimeLeft())
       ))).filter(Boolean);
 
       // 更新のたびにフッターが増えないよう、前回追加した要素を先に取り除く。
@@ -103,11 +107,11 @@
           root.style.overflowY = "hidden";
           try {
             // decodeと描画フレームが来ない場合も、期限後は現状の高さで報告する。
-            await withinTimeout(image.decode(), config.imageProbeTimeoutMs);
+            await withinTimeout(image.decode(), imageTimeLeft());
             // 画像のレイアウト確定を2フレーム待ってから、Rust側へ正確な高さを返す。
             await withinTimeout(new Promise(resolve => requestAnimationFrame(
               () => requestAnimationFrame(resolve)
-            )), config.imageProbeTimeoutMs);
+            )), imageTimeLeft());
             contentHeight = Math.ceil(footer.getBoundingClientRect().bottom + window.scrollY);
           } finally {
             root.style.overflowY = previousOverflowY;
