@@ -240,7 +240,7 @@ rust-toolchain.toml  ビルドに使うRustの版。CIと手元で同じ版に�
 src-web/             設定画面とポートレット起動用のHTML・CSS・JavaScript（npmなし）
 src-tauri/           Rust/Tauriのソース、固定設定、WebViewへ注入するJavaScript
 scripts/dev-env.ps1  ビルド・テストの共通土台。Cargoの出力先と、src-tauri/genのジャンクション操作
-scripts/build/       リリースビルド。app.ps1がexeをtemp/release/へ置く
+scripts/build/       リリースビルド。app.ps1がexeをrelease/へ置く
 scripts/deps/        依存の更新。resolve-cargo-cooldown.ps1がCargo.lockの公開後日数を検査・解決する
 scripts/test/        テスト。rust.ps1（fmt・Clippy・cargo test）、javascript.ps1（Nodeのテスト）とそのfixture
 ```
@@ -259,7 +259,7 @@ npmは不要です。各スクリプトはリポジトリのどこから実行�
 生成されるexe：
 
 ```text
-temp\release\CreateWebFlowChecker.exe
+release\CreateWebFlowChecker.exe
 ```
 
 生成された`CreateWebFlowChecker.exe`を任意の場所へコピーして使用できます。

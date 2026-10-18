@@ -1,12 +1,12 @@
-﻿# Tauriアプリをリリースビルドし、temp/release/CreateWebFlowChecker.exeへ置く。
+﻿# Tauriアプリをリリースビルドし、release/CreateWebFlowChecker.exeへ置く。
 param([switch]$Clean)
 . "$PSScriptRoot\..\dev-env.ps1"
 $root = Split-Path (Split-Path $PSScriptRoot)
 $manifest = Join-Path $root 'src-tauri\Cargo.toml'
-$release = Join-Path $root 'temp\release'
+$release = Join-Path $root 'release'
 $exeName = 'CreateWebFlowChecker.exe'
 
-# temp/release/から起動中のコピーがあると、置き換え時にファイルがロックされる。
+# release/から起動中のコピーがあると、置き換え時にファイルがロックされる。
 function Stop-ReleaseCopies {
     foreach ($running in @(Get-CimInstance Win32_Process -Filter "Name = '$exeName'" -ErrorAction SilentlyContinue |
             Where-Object { $_.ExecutablePath -like "$release\*" })) {
