@@ -19,24 +19,74 @@ const BLOCKED_DOWNLOAD_EXTENSIONS: &[&str] = &[
 ];
 
 /// WebView2が利用する、一時キャッシュの親フォルダーを返す。
-fn cache_root() -> PathBuf {
-    std::env::temp_dir()
+///
+/// 橿原市の他のアプリ（KSIPなど）と同じく、利用者ごとの
+/// `%LOCALAPPDATA%\KashiharaCity\<アプリ名>\temp`の下に置く。
+/// LocalAppDataを解決できない環境では、OSの一時フォルダーを代わりに使う。
+fn cache_root(local_data_dir: Option<PathBuf>) -> PathBuf {
+    local_data_dir
+        .unwrap_or_else(std::env::temp_dir)
         .join("KashiharaCity")
         .join("CwfChecker")
+        .join("temp")
         .join("WebView2")
 }
 
-/// 起動ごとに空のWebView2キャッシュを用意する。
-pub(super) fn prepare_cache() -> std::io::Result<PathBuf> {
-    let root = cache_root();
+/// 起動ごとに空のWebView2キャッシュを用意し、0.1.9以前の版の置き場所を片付ける。
+///
+/// `local_data_dir`は`%LOCALAPPDATA%`、`app_local_data_dir`はその下のidentifier名の
+/// フォルダー（Tauriが`data_directory`未指定のWebViewに使う既定の場所）を渡す。
+pub(super) fn prepare_cache(
+    local_data_dir: Option<PathBuf>,
+    app_local_data_dir: Option<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    // 旧版はメイン画面と案件画面のデータを`%TEMP%`の下へ置いていた。
+    // 認証状態のCookieを含み得るため、新しい場所へ移った後も残さない。
+    let temp = std::env::temp_dir();
+    remove_with_empty_parents(
+        &temp
+            .join("KashiharaCity")
+            .join("CwfChecker")
+            .join("WebView2"),
+        &temp,
+    );
+    // 旧版の設定画面は`data_directory`を指定せず、Tauri既定の場所を使っていた。
+    if let Some(app_local) = app_local_data_dir {
+        if let Some(base) = app_local.parent() {
+            remove_with_empty_parents(&app_local.join("EBWebView"), base);
+        }
+    }
+    reset_cache(&cache_root(local_data_dir), std::process::id())
+}
+
+/// `root`を作り直し、その下に今回のプロセス用の空フォルダーを作る。
+fn reset_cache(root: &Path, process_id: u32) -> std::io::Result<PathBuf> {
     // WebView2の認証状態を次回起動へ持ち越さない。単一起動プラグインにより、
     // 同時に使用中の別プロセスのキャッシュを消す状況は避けられる。
+    // 終了時に消さないのは、WebView2のプロセスが閉じた後もしばらくファイルを
+    // 掴んでいて、確実に消すには終了を待たせる必要があるため。
     if root.exists() {
-        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(root);
     }
-    let current = root.join(std::process::id().to_string());
+    let current = root.join(process_id.to_string());
     fs::create_dir_all(&current)?;
     Ok(current)
+}
+
+/// `dir`を中身ごと消し、`base`より下の親フォルダーを空になった分だけ消す。
+///
+/// 親フォルダーは`remove_dir`で消すため、ほかのアプリのデータが入っていれば残る。
+fn remove_with_empty_parents(dir: &Path, base: &Path) {
+    if fs::remove_dir_all(dir).is_err() {
+        return;
+    }
+    let mut parent = dir.parent();
+    while let Some(current) = parent {
+        if current == base || !current.starts_with(base) || fs::remove_dir(current).is_err() {
+            break;
+        }
+        parent = current.parent();
+    }
 }
 
 /// アプリ管理のダウンロードフォルダーを残し、中身だけをすべて削除する。
@@ -192,13 +242,78 @@ pub(super) fn configure_download(
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_directory, is_blocked_download, is_managed_download, is_trusted_download};
+    use super::{
+        cache_root, cleanup_directory, is_blocked_download, is_managed_download,
+        is_trusted_download, remove_with_empty_parents, reset_cache,
+    };
     use std::{
         fs,
-        path::Path,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
     use url::Url;
+
+    fn unique_test_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("cwfchecker-{name}-test-{unique}"))
+    }
+
+    #[test]
+    fn places_the_webview_cache_beside_other_kashihara_city_apps() {
+        let local = PathBuf::from(r"C:\Users\someone\AppData\Local");
+        assert_eq!(
+            cache_root(Some(local.clone())),
+            local.join(r"KashiharaCity\CwfChecker\temp\WebView2")
+        );
+        assert!(cache_root(None).starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn resets_only_the_webview_cache_for_the_new_process() {
+        let root = unique_test_root("cache");
+        let app_temp = root.join(r"KashiharaCity\CwfChecker\temp");
+        let cache = app_temp.join("WebView2");
+        let previous = cache.join("1000");
+        let sibling = app_temp.join("other");
+        fs::create_dir_all(previous.join(r"EBWebView\Default")).expect("create previous cache");
+        fs::write(previous.join(r"EBWebView\Default\Cookies"), b"old").expect("write cookie");
+        fs::create_dir_all(&sibling).expect("create sibling");
+
+        let current = reset_cache(&cache, 2000).expect("reset cache");
+
+        assert_eq!(current, cache.join("2000"));
+        assert!(current.is_dir());
+        assert!(!previous.exists());
+        // temp\の下にWebView2以外が置かれても巻き込まない。
+        assert!(sibling.is_dir());
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn removes_legacy_data_and_only_the_parents_left_empty() {
+        let root = unique_test_root("legacy");
+        let legacy = root.join(r"KashiharaCity\CwfChecker\WebView2");
+        let other_app = root.join(r"KashiharaCity\ksip");
+        fs::create_dir_all(legacy.join("1000")).expect("create legacy cache");
+        fs::create_dir_all(&other_app).expect("create other app folder");
+
+        remove_with_empty_parents(&legacy, &root);
+
+        assert!(!root.join(r"KashiharaCity\CwfChecker").exists());
+        // ほかのアプリのフォルダーが残る親と、基点そのものは消さない。
+        assert!(other_app.is_dir());
+        assert!(root.is_dir());
+
+        fs::remove_dir_all(&other_app).expect("remove other app folder");
+        fs::create_dir_all(&legacy).expect("recreate legacy cache");
+        remove_with_empty_parents(&legacy, &root);
+        assert!(!root.join("KashiharaCity").exists());
+        assert!(root.is_dir());
+        fs::remove_dir(root).expect("remove test root");
+    }
 
     #[test]
     fn blocks_executable_downloads_and_windows_name_tricks() {

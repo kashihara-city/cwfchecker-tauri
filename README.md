@@ -206,11 +206,11 @@ XFV20/manual/user/_images/cwfchecker_footer05.png
 ## 一時データとダウンロード
 
 - WebView2の一時データ：
-  `%TEMP%\KashiharaCity\CwfChecker\WebView2\<プロセスID>`
+  `%LOCALAPPDATA%\KashiharaCity\CwfChecker\temp\WebView2\<プロセスID>`
 - 添付ファイル：
   `%USERPROFILE%\Documents\cwf_downloads`
 
-WebView2の一時データは起動時に作り直します。
+WebView2の一時データ（Cookieやキャッシュを含む）は起動時に作り直すので、丸ごと削除してかまいません。
 案件画面でダウンロードしたファイルはWindowsの関連付けアプリで開き、
 案件画面をすべて閉じた際に、`cwf_downloads`内のファイルとサブフォルダーをすべて削除します。
 残したい添付ファイルや展開内容は、案件画面を閉じる前に別のフォルダーへ移してください。

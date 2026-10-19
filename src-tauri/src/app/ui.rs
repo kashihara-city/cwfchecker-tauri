@@ -41,11 +41,17 @@ pub(super) fn open_settings(app: &AppHandle) -> Result<(), String> {
         window.set_focus().map_err(|error| error.to_string())?;
         return Ok(());
     }
+    let state = app
+        .try_state::<Arc<AppState>>()
+        .ok_or_else(|| "アプリの状態を取得できませんでした。".to_owned())?;
     let menu = build_window_menu(app, SETTINGS_LABEL).map_err(|error| error.to_string())?;
     WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
         .title("CreateWebFlowChecker — 設定")
         .inner_size(600.0, 900.0)
         .center()
+        // 省略するとTauri既定の`%LOCALAPPDATA%\<identifier>\EBWebView`へ置かれ、
+        // 起動時の削除から漏れる。メイン画面と同じフォルダーでWebView2のプロセスも共有する。
+        .data_directory(state.cache_root.clone())
         .menu(menu)
         .on_menu_event(|window, event| {
             handle_window_menu(window, event.id().as_ref());

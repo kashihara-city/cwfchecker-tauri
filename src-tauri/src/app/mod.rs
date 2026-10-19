@@ -322,7 +322,10 @@ pub fn save_settings(
 
 /// Tauri起動時に一度だけ呼ばれ、共有状態と各UI部品を準備する。
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let cache_root = prepare_cache()?;
+    let cache_root = prepare_cache(
+        app.path().local_data_dir().ok(),
+        app.path().app_local_data_dir().ok(),
+    )?;
     let download_dir = app.path().document_dir()?.join("cwf_downloads");
     let settings = migration::load_or_migrate()?;
     if let Err(error) = registry_support::report_io(
